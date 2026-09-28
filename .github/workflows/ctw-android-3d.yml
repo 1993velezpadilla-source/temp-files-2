@@ -1,0 +1,28 @@
+name: CTW Android 3D Bootstrap
+
+on:
+  push:
+    branches:
+      - feature/ctw-android-3d-bootstrap
+    paths:
+      - 'gta-ctw-android-3d/**'
+      - '.github/workflows/ctw-android-3d.yml'
+  workflow_dispatch:
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Python syntax gate
+        run: python3 -m py_compile gta-ctw-android-3d/tools/extract_ctw_apk.py
+
+      - name: CMake configure
+        run: cmake -S gta-ctw-android-3d/native -B build/ctw
+
+      - name: Native build
+        run: cmake --build build/ctw --parallel 2
+
+      - name: Bootstrap marker
+        run: echo CTW_BOOTSTRAP_GREEN
