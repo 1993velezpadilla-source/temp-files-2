@@ -2292,7 +2292,7 @@ def command_bundle(args):
     return 0
 
 
-def command_timeline(args):
+def command_target_timeline(args):
     data = target_event_timeline(
         args.capture,
         args.bssid,
@@ -2306,7 +2306,7 @@ def command_timeline(args):
     return 0 if data.get("total_events", 0) else 6
 
 
-def command_channels(args):
+def command_capture_channels(args):
     data = channel_observation_summary(args.capture)
     print(json.dumps(data, indent=2))
     if args.report:
@@ -2515,18 +2515,18 @@ def build_parser():
     bd.add_argument("--output-dir", default="wifi_exam_bundle")
     bd.set_defaults(func=command_bundle)
 
-    tl = sub.add_parser("timeline", help="Build a passive event timeline for one authorized AP.")
+    tl = sub.add_parser("target-timeline", help="Build a passive event timeline for one authorized AP.")
     tl.add_argument("capture")
     tl.add_argument("--bssid", required=True, help="Selected authorized AP BSSID.")
     tl.add_argument("--window", type=float, default=15.0, help="Correlation window in seconds.")
     tl.add_argument("--max-events", type=int, default=500)
     tl.add_argument("--report", default="")
-    tl.set_defaults(func=command_timeline)
+    tl.set_defaults(func=command_target_timeline)
 
-    ch = sub.add_parser("channels", help="Summarize passive channel/frequency observations in a capture.")
+    ch = sub.add_parser("capture-channels", help="Summarize passive channel/frequency observations in a capture.")
     ch.add_argument("capture")
     ch.add_argument("--report", default="")
-    ch.set_defaults(func=command_channels)
+    ch.set_defaults(func=command_capture_channels)
 
     cp = sub.add_parser("compare", help="Compare two passive capture profiles for configuration drift.")
     cp.add_argument("baseline")
