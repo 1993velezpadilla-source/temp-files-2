@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 
-APP_VERSION = "0.3"
+APP_VERSION = "0.4"
 
 
 def run(cmd):
@@ -193,6 +193,8 @@ def adapter_diagnostics():
             "tshark": tool_exists("tshark"),
             "dumpcap": tool_exists("dumpcap"),
             "capinfos": tool_exists("capinfos"),
+            "tcpdump": tool_exists("tcpdump"),
+            "kismet": tool_exists("kismet"),
             "nmcli": tool_exists("nmcli"),
             "iw": tool_exists("iw"),
             "netsh": tool_exists("netsh"),
@@ -396,6 +398,203 @@ def analyze_capture(path, target_bssid=None):
     return result
 
 
+
+
+def tool_version(name):
+    if not tool_exists(name):
+        return ""
+    probes = {
+        "tshark": [[name, "--version"]],
+        "dumpcap": [[name, "--version"]],
+        "capinfos": [[name, "--version"]],
+        "nmcli": [[name, "--version"]],
+        "iw": [[name, "--version"]],
+        "kismet": [[name, "--version"]],
+    }
+    for cmd in probes.get(name, [[name, "--version"], [name, "-v"]]):
+        rc, out = run(cmd)
+        if rc == 0 and out.strip():
+            return out.splitlines()[0].strip()
+    return ""
+
+
+def neighbor_snapshot():
+    system = platform.system().lower()
+    data = {"platform": platform.system(), "commands": {}}
+    if "windows" in system:
+        commands = {
+            "arp": ["arp", "-a"],
+            "getmac": ["getmac", "/v"],
+        }
+    elif "linux" in system:
+        commands = {
+            "ip_neigh": ["ip", "neigh"],
+        }
+    else:
+        commands = {}
+
+    for name, cmd in commands.items():
+        rc, out = run(cmd)
+        data["commands"][name] = {"ok": rc == 0, "output": out}
+    return data
+
+
+def readiness_check():
+    diag = adapter_diagnostics()
+    networks, scan_raw = scan_networks()
+    local = local_network_info()
+    available = _tshark_field_names() if tool_exists("tshark") else set()
+
+    required_field_groups = {
+        "ssid": ["wlan.ssid"],
+        "bssid": ["wlan.bssid"],
+        "eapol": ["eapol.type"],
+        "pmf_capable": ["wlan.rsn.capabilities.mfpc", "wlan_mgt.rsn.capabilities.mfpc"],
+        "pmf_required": ["wlan.rsn.capabilities.mfpr", "wlan_mgt.rsn.capabilities.mfpr"],
+        "wps": ["wps.ap_setup_locked", "wps.config_methods"],
+        "akm": ["wlan.rsn.akms.type", "wlan_mgt.rsn.akms.type"],
+        "pairwise_cipher": ["wlan.rsn.pcs.type", "wlan_mgt.rsn.pcs.type"],
+    }
+
+    support = {}
+    for logical, options in required_field_groups.items():
+        support[logical] = _first_supported_field(available, options) or ""
+
+    checks = {
+        "wifi_scan_available": bool(networks),
+        "tshark_available": bool(diag["tools"].get("tshark")),
+        "capture_interfaces_visible": bool(diag.get("capture_interfaces")),
+        "local_gateway_detected": bool(local.get("gateway")),
+        "ssid_field_supported": bool(support["ssid"]),
+        "bssid_field_supported": bool(support["bssid"]),
+        "eapol_field_supported": bool(support["eapol"]),
+        "pmf_fields_supported": bool(support["pmf_capable"] or support["pmf_required"]),
+        "wps_fields_supported": bool(support["wps"]),
+        "rsn_fields_supported": bool(support["akm"] or support["pairwise_cipher"]),
+    }
+
+    essential = [
+        checks["wifi_scan_available"],
+        checks["tshark_available"],
+        checks["ssid_field_supported"],
+        checks["bssid_field_supported"],
+        checks["eapol_field_supported"],
+    ]
+    if all(essential):
+        status = "READY_FOR_SCAN_AND_IMPORTED_CAPTURE_ANALYSIS"
+    elif checks["wifi_scan_available"]:
+        status = "SCAN_READY_CAPTURE_ANALYSIS_INCOMPLETE"
+    else:
+        status = "NOT_READY"
+
+    versions = {}
+    for name in ["tshark", "dumpcap", "capinfos", "nmcli", "iw", "kismet"]:
+        v = tool_version(name)
+        if v:
+            versions[name] = v
+
+    return {
+        "timestamp": datetime.datetime.now().astimezone().isoformat(),
+        "status": status,
+        "checks": checks,
+        "supported_fields": support,
+        "tool_versions": versions,
+        "network_count_visible": len(networks),
+        "local_gateway": local.get("gateway", ""),
+        "capture_interfaces": diag.get("capture_interfaces", []),
+        "notes": [
+            "A passing readiness check confirms scan/import-analysis capability, not monitor-mode support.",
+            "Raw 802.11 live capture still depends on adapter, driver, operating system and permissions.",
+        ],
+        "scan_error_excerpt": scan_raw[:500] if not networks else "",
+    }
+
+
+def capture_quality(path, target_bssid=""):
+    stats = capture_statistics(path)
+    profile = passive_ap_profiles(path)
+    handshake = analyze_capture(path, target_bssid or None)
+
+    target_norm = normalize_mac(target_bssid)
+    target_profile = None
+    if target_norm:
+        for ap in profile.get("aps", []):
+            if normalize_mac(ap.get("bssid")) == target_norm:
+                target_profile = ap
+                break
+
+    checks = {
+        "file_exists": bool(stats.get("exists")),
+        "frames_present": (stats.get("frame_count") or 0) > 0,
+        "management_frames_present": any(
+            (v or 0) > 0 for v in stats.get("management_counts", {}).values()
+        ),
+        "ap_profiles_present": bool(profile.get("aps")),
+        "target_ap_observed": bool(target_profile) if target_bssid else None,
+        "eapol_present": (handshake.get("eapol_frame_count") or 0) > 0,
+        "complete_4_way_observed": handshake.get("handshake_evidence") == "COMPLETE_4_WAY_SEQUENCE_OBSERVED",
+        "signal_metadata_present": any(
+            ap.get("signal_dbm_avg") is not None for ap in profile.get("aps", [])
+        ),
+        "security_metadata_present": any(
+            ap.get("akm_types") or ap.get("pairwise_cipher_types") or ap.get("group_cipher_types")
+            for ap in profile.get("aps", [])
+        ),
+        "pmf_metadata_present": any(
+            ap.get("pmf_capable") or ap.get("pmf_required") for ap in profile.get("aps", [])
+        ),
+        "wps_metadata_present": any(
+            ap.get("wps_advertised") for ap in profile.get("aps", [])
+        ),
+    }
+
+    missing = []
+    if not checks["file_exists"]:
+        missing.append("capture file")
+    if checks["file_exists"] and not checks["frames_present"]:
+        missing.append("packet frames")
+    if checks["frames_present"] and not checks["management_frames_present"]:
+        missing.append("802.11 management evidence")
+    if target_bssid and not checks["target_ap_observed"]:
+        missing.append("selected target BSSID")
+    if not checks["eapol_present"]:
+        missing.append("EAPOL evidence")
+    elif not checks["complete_4_way_observed"]:
+        missing.append("complete M1/M2/M3/M4 observation")
+
+    core_values = [
+        checks["file_exists"],
+        checks["frames_present"],
+        checks["management_frames_present"],
+        checks["ap_profiles_present"],
+        checks["eapol_present"],
+    ]
+    if target_bssid:
+        core_values.append(checks["target_ap_observed"])
+
+    if all(core_values) and checks["complete_4_way_observed"]:
+        status = "STRONG_EVIDENCE_SET"
+    elif all(core_values):
+        status = "USABLE_PARTIAL_EVIDENCE"
+    elif checks["frames_present"]:
+        status = "CAPTURE_PRESENT_BUT_MISSING_CORE_EVIDENCE"
+    else:
+        status = "UNUSABLE_OR_EMPTY"
+
+    return {
+        "capture": str(path),
+        "target_bssid": target_bssid,
+        "status": status,
+        "checks": checks,
+        "missing_core_evidence": missing,
+        "handshake_evidence": handshake.get("handshake_evidence"),
+        "message_counts": handshake.get("message_counts"),
+        "target_profile": target_profile,
+        "capture_statistics": stats,
+        "warnings": list(dict.fromkeys(
+            (profile.get("warnings") or []) + (handshake.get("warnings") or [])
+        )),
+    }
 
 def file_sha256(path):
     h = hashlib.sha256()
@@ -805,6 +1004,33 @@ def command_capture(args):
 
 
 
+
+def command_readiness(args):
+    data = readiness_check()
+    print(json.dumps(data, indent=2))
+    if args.report:
+        p = save_report({"readiness": data}, args.report)
+        print(f"\nReport saved: {p}")
+    return 0 if data.get("status") == "READY_FOR_SCAN_AND_IMPORTED_CAPTURE_ANALYSIS" else 4
+
+
+def command_quality(args):
+    data = capture_quality(args.capture, args.bssid)
+    print(json.dumps(data, indent=2))
+    if args.report:
+        p = save_report({"capture_quality": data}, args.report)
+        print(f"\nReport saved: {p}")
+    return 0 if data.get("status") in {"STRONG_EVIDENCE_SET", "USABLE_PARTIAL_EVIDENCE"} else 5
+
+
+def command_neighbors(args):
+    data = neighbor_snapshot()
+    print(json.dumps(data, indent=2))
+    if args.report:
+        p = save_report({"neighbor_snapshot": data}, args.report)
+        print(f"\nReport saved: {p}")
+    return 0
+
 def command_netinfo(args):
     data = local_network_info()
     print(json.dumps(data, indent=2))
@@ -859,6 +1085,7 @@ def command_interactive(args):
         "target": target,
         "diagnostics": adapter_diagnostics(),
         "local_network": local_network_info(),
+        "readiness": readiness_check(),
     }
 
     capture = input("\nOptional PCAP/PCAPNG path (Enter to skip): ").strip()
@@ -866,6 +1093,7 @@ def command_interactive(args):
         analysis = analyze_capture(capture, target.get("bssid"))
         payload["capture_analysis"] = analysis
         payload["capture_statistics"] = capture_statistics(capture)
+        payload["capture_quality"] = capture_quality(capture, target.get("bssid"))
         payload["passive_ap_profile"] = passive_ap_profiles(capture)
         payload["target_station_summary"] = anonymized_station_summary(capture, target.get("bssid"))
         print("\nCAPTURE ANALYSIS")
@@ -898,6 +1126,20 @@ def build_parser():
     c.add_argument("--bssid", default="", help="Optional AP BSSID filter.")
     c.add_argument("--report", default="")
     c.set_defaults(func=command_capture)
+
+    rd = sub.add_parser("readiness", help="Check whether the machine is ready for scan/imported-capture analysis.")
+    rd.add_argument("--report", default="")
+    rd.set_defaults(func=command_readiness)
+
+    q = sub.add_parser("quality", help="Score whether a capture contains useful authorized exam evidence.")
+    q.add_argument("capture")
+    q.add_argument("--bssid", default="", help="Optional selected AP BSSID.")
+    q.add_argument("--report", default="")
+    q.set_defaults(func=command_quality)
+
+    nb = sub.add_parser("neighbors", help="Snapshot the local OS neighbor table without scanning other hosts.")
+    nb.add_argument("--report", default="")
+    nb.set_defaults(func=command_neighbors)
 
     n = sub.add_parser("netinfo", help="Collect local interface/gateway diagnostics.")
     n.add_argument("--report", default="")
