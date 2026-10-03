@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import zipfile
 from pathlib import Path
 
@@ -2065,6 +2066,101 @@ def channel_observation_summary(path):
     return result
 
 
+
+def watch_target(ssid="", bssid="", interval_seconds=2.0, samples=30):
+    interval_seconds = max(0.5, float(interval_seconds))
+    samples = max(1, min(int(samples), 300))
+    wanted_bssid = normalize_mac(bssid)
+    observations = []
+    previous_signature = None
+
+    result = {
+        "ssid": ssid,
+        "bssid": bssid,
+        "interval_seconds": interval_seconds,
+        "requested_samples": samples,
+        "observations": observations,
+        "changes": [],
+        "status": "NOT_SEEN",
+        "note": "Uses normal operating-system Wi-Fi scans only.",
+    }
+
+    if not ssid and not bssid:
+        result["status"] = "INVALID_TARGET"
+        result["error"] = "Provide an SSID or BSSID."
+        return result
+
+    for i in range(samples):
+        networks, raw = scan_networks()
+        if wanted_bssid:
+            matches = [
+                n for n in networks
+                if normalize_mac(n.get("bssid")) == wanted_bssid
+            ]
+        else:
+            matches = [
+                n for n in networks
+                if (n.get("ssid") or "") == ssid
+            ]
+
+        stamp = datetime.datetime.now().astimezone().isoformat()
+        entry = {
+            "sample": i + 1,
+            "timestamp": stamp,
+            "match_count": len(matches),
+            "matches": matches,
+        }
+
+        if len(matches) == 1:
+            n = matches[0]
+            signature = (
+                n.get("bssid", ""),
+                n.get("channel", ""),
+                n.get("security", ""),
+                n.get("signal", ""),
+            )
+            entry["state"] = "UNIQUE_MATCH"
+            if previous_signature is not None and signature != previous_signature:
+                result["changes"].append({
+                    "timestamp": stamp,
+                    "previous": {
+                        "bssid": previous_signature[0],
+                        "channel": previous_signature[1],
+                        "security": previous_signature[2],
+                        "signal": previous_signature[3],
+                    },
+                    "current": {
+                        "bssid": signature[0],
+                        "channel": signature[1],
+                        "security": signature[2],
+                        "signal": signature[3],
+                    },
+                })
+            previous_signature = signature
+            result["status"] = "SEEN"
+        elif len(matches) > 1:
+            entry["state"] = "AMBIGUOUS"
+            result["status"] = "AMBIGUOUS"
+        else:
+            entry["state"] = "NOT_SEEN"
+            if not networks:
+                entry["scan_error_excerpt"] = raw[:300]
+
+        observations.append(entry)
+        if i + 1 < samples:
+            time.sleep(interval_seconds)
+
+    result["unique_match_samples"] = sum(
+        1 for x in observations if x.get("state") == "UNIQUE_MATCH"
+    )
+    result["ambiguous_samples"] = sum(
+        1 for x in observations if x.get("state") == "AMBIGUOUS"
+    )
+    result["missing_samples"] = sum(
+        1 for x in observations if x.get("state") == "NOT_SEEN"
+    )
+    return result
+
 def save_report(payload, output="wifi_lab_report.json"):
     p = Path(output)
     envelope = {
@@ -2315,6 +2411,20 @@ def command_capture_channels(args):
     return 0 if data.get("channels") else 7
 
 
+
+def command_watch(args):
+    data = watch_target(
+        ssid=args.ssid,
+        bssid=args.bssid,
+        interval_seconds=args.interval,
+        samples=args.samples,
+    )
+    print(json.dumps(data, indent=2))
+    if args.report:
+        p = save_report({"target_watch": data}, args.report)
+        print(f"\nReport saved: {p}")
+    return 0 if data.get("status") in {"SEEN", "AMBIGUOUS"} else 9
+
 def command_compare(args):
     data = compare_capture_profiles(args.baseline, args.current)
     print(json.dumps(data, indent=2))
@@ -2527,6 +2637,14 @@ def build_parser():
     ch.add_argument("capture")
     ch.add_argument("--report", default="")
     ch.set_defaults(func=command_capture_channels)
+
+    wt = sub.add_parser("watch", help="Watch an authorized SSID/BSSID with normal OS Wi-Fi scans.")
+    wt.add_argument("--ssid", default="", help="Exact SSID to observe.")
+    wt.add_argument("--bssid", default="", help="Exact BSSID to observe.")
+    wt.add_argument("--interval", type=float, default=2.0, help="Seconds between scans; minimum 0.5.")
+    wt.add_argument("--samples", type=int, default=30, help="Number of scans; maximum 300.")
+    wt.add_argument("--report", default="")
+    wt.set_defaults(func=command_watch)
 
     cp = sub.add_parser("compare", help="Compare two passive capture profiles for configuration drift.")
     cp.add_argument("baseline")
