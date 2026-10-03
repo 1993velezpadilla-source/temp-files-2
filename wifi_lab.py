@@ -13,7 +13,7 @@ import zipfile
 from pathlib import Path
 
 
-APP_VERSION = "1.5"
+APP_VERSION = "1.6"
 
 
 def run(cmd):
@@ -2242,6 +2242,8 @@ def build_exam_bundle(capture_path="", target_lock_path="wifi_target_lock.json",
         "local_network": local,
         "neighbor_snapshot": neighbors,
         "security_findings": build_security_findings(target=target),
+        "preflight": exam_preflight(target_lock_path, capture_path),
+        "evidence_completeness": evidence_completeness(target, capture_path) if target else {"status": "NO_TARGET", "score_percent": 0},
     }
 
     if capture_path:
@@ -2290,6 +2292,13 @@ def build_exam_bundle(capture_path="", target_lock_path="wifi_target_lock.json",
     html_path = out / "exam_bundle.html"
     html_path.write_text(render_html_report(envelope), encoding="utf-8")
 
+    custody_path = out / "chain_of_custody.json"
+    custody = chain_of_custody(
+        [str(report_path), str(md_path), str(html_path)] + ([capture_path] if capture_path else []),
+        output=str(custody_path),
+        target_lock_path=target_lock_path,
+    )
+
     manifest = {
         "created_at": envelope["created_at"],
         "app_version": APP_VERSION,
@@ -2304,11 +2313,13 @@ def build_exam_bundle(capture_path="", target_lock_path="wifi_target_lock.json",
             "json_report": str(report_path),
             "markdown_report": str(md_path),
             "html_report": str(html_path),
+            "chain_of_custody": str(custody_path),
         },
         "file_hashes": {
             "exam_bundle.json": file_sha256(report_path),
             "exam_bundle.md": file_sha256(md_path),
             "exam_bundle.html": file_sha256(html_path),
+            "chain_of_custody.json": file_sha256(custody_path),
         },
         "scan_error_excerpt": scan_raw[:500] if not networks else "",
     }
@@ -2320,6 +2331,7 @@ def build_exam_bundle(capture_path="", target_lock_path="wifi_target_lock.json",
         "json_report": str(report_path),
         "markdown_report": str(md_path),
         "html_report": str(html_path),
+        "chain_of_custody": str(custody_path),
         "manifest": str(manifest_path),
         "target": target,
         "capture_included": bool(capture_path),
@@ -2996,6 +3008,175 @@ def capture_ap_index(path, ssid_query=""):
         ),
     }
 
+
+def evidence_completeness(target=None, capture_path=""):
+    target = target or {}
+    checks = {
+        "target_present": bool(target),
+        "target_bssid_present": bool(target.get("bssid")),
+        "target_security_classified": bool(
+            (target.get("security_detail") or {}).get("mode") or target.get("security")
+        ),
+        "capture_present": False,
+        "capture_hash_available": False,
+        "target_seen_in_capture": False,
+        "eapol_present": False,
+        "complete_4_way_observed": False,
+        "ap_profile_available": False,
+        "timeline_available": False,
+    }
+    details = {}
+    if capture_path:
+        p = Path(capture_path)
+        checks["capture_present"] = p.exists()
+        if p.exists():
+            details["capture_sha256"] = file_sha256(p)
+            checks["capture_hash_available"] = bool(details["capture_sha256"])
+            bssid = target.get("bssid", "")
+            quality = capture_quality(capture_path, bssid)
+            analysis = analyze_capture(capture_path, bssid or None)
+            profile = passive_ap_profiles(capture_path)
+            timeline = target_event_timeline(capture_path, bssid) if bssid else {"total_events": 0}
+            checks["target_seen_in_capture"] = (
+                quality.get("checks", {}).get("target_ap_observed") is True
+                if bssid else False
+            )
+            checks["eapol_present"] = (analysis.get("eapol_frame_count") or 0) > 0
+            checks["complete_4_way_observed"] = (
+                analysis.get("handshake_evidence") == "COMPLETE_4_WAY_SEQUENCE_OBSERVED"
+            )
+            checks["ap_profile_available"] = bool(profile.get("aps"))
+            checks["timeline_available"] = (timeline.get("total_events") or 0) > 0
+            details["capture_quality"] = quality.get("status")
+            details["handshake_evidence"] = analysis.get("handshake_evidence")
+            details["message_counts"] = analysis.get("message_counts")
+    weights = {
+        "target_present": 10,
+        "target_bssid_present": 10,
+        "target_security_classified": 10,
+        "capture_present": 15,
+        "capture_hash_available": 10,
+        "target_seen_in_capture": 15,
+        "eapol_present": 10,
+        "complete_4_way_observed": 10,
+        "ap_profile_available": 5,
+        "timeline_available": 5,
+    }
+    score = sum(weights[k] for k, ok in checks.items() if ok)
+    if score >= 90:
+        status = "EXCELLENT_EVIDENCE_COMPLETENESS"
+    elif score >= 70:
+        status = "GOOD_EVIDENCE_COMPLETENESS"
+    elif score >= 45:
+        status = "PARTIAL_EVIDENCE_COMPLETENESS"
+    else:
+        status = "INSUFFICIENT_EVIDENCE_COMPLETENESS"
+    missing = [k for k, ok in checks.items() if not ok]
+    return {
+        "score_percent": score,
+        "status": status,
+        "checks": checks,
+        "missing": missing,
+        "details": details,
+        "note": "This is an evidence-completeness score, not a password-recovery probability.",
+    }
+
+
+def exam_preflight(target_lock_path="wifi_target_lock.json", capture_path=""):
+    target = load_target_lock(target_lock_path)
+    readiness = readiness_check()
+    toolchain = offline_toolchain_report()
+    radio = radio_capabilities()
+    blockers = []
+    warnings = []
+
+    if not target:
+        blockers.append("No target lock is present.")
+    else:
+        validation = validate_target_lock_against_scan(target_lock_path)
+        if validation.get("status") not in {"SEEN_EXACT", "SEEN_CHANNEL_CHANGED"}:
+            warnings.append(
+                f"Locked target is not currently an exact visible match: {validation.get('status')}"
+            )
+
+    if not readiness.get("checks", {}).get("wifi_scan_available"):
+        blockers.append("Normal Wi-Fi scanning is not available on this machine.")
+    if capture_path and not Path(capture_path).exists():
+        blockers.append("The requested capture file does not exist.")
+    if capture_path and not tool_exists("tshark"):
+        blockers.append("TShark is required for imported capture analysis.")
+    if not tool_exists("tshark"):
+        warnings.append("No TShark detected; scan-only mode can still work.")
+    if radio.get("monitor_mode_detected") is False:
+        warnings.append(
+            "Monitor mode was not detected. This does not prevent imported-capture analysis."
+        )
+
+    completeness = evidence_completeness(target, capture_path) if target else {
+        "score_percent": 0,
+        "status": "NO_TARGET",
+        "checks": {},
+        "missing": ["target_present"],
+        "details": {},
+    }
+
+    status = "READY" if not blockers else "BLOCKED"
+    if status == "READY" and warnings:
+        status = "READY_WITH_WARNINGS"
+
+    return {
+        "timestamp": datetime.datetime.now().astimezone().isoformat(),
+        "status": status,
+        "blockers": blockers,
+        "warnings": warnings,
+        "target": target,
+        "readiness": readiness,
+        "toolchain": toolchain,
+        "radio_capabilities": radio,
+        "evidence_completeness": completeness,
+    }
+
+
+def chain_of_custody(paths, output="chain_of_custody.json", target_lock_path="wifi_target_lock.json"):
+    items = []
+    for raw in paths:
+        p = Path(raw)
+        item = {
+            "path": str(p),
+            "exists": p.exists(),
+            "size_bytes": p.stat().st_size if p.exists() and p.is_file() else 0,
+            "sha256": file_sha256(p) if p.exists() and p.is_file() else "",
+            "modified_epoch": p.stat().st_mtime if p.exists() else None,
+        }
+        items.append(item)
+
+    target = load_target_lock(target_lock_path)
+    record = {
+        "app": "WiFi Security Lab",
+        "version": APP_VERSION,
+        "created_at": datetime.datetime.now().astimezone().isoformat(),
+        "host": {
+            "platform": platform.platform(),
+            "python": sys.version.split()[0],
+        },
+        "target": target,
+        "target_fingerprint": target_fingerprint(target) if target else "",
+        "evidence": items,
+        "note": (
+            "Hashes document the exact files inspected at the time this record was generated."
+        ),
+    }
+    canonical = json.dumps(record, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    record["record_sha256"] = hashlib.sha256(canonical).hexdigest()
+    out = Path(output)
+    out.write_text(json.dumps(record, indent=2), encoding="utf-8")
+    return {
+        "output": str(out),
+        "record_sha256": record["record_sha256"],
+        "evidence_count": len(items),
+        "record": record,
+    }
+
 def save_report(payload, output="wifi_lab_report.json"):
     p = Path(output)
     envelope = {
@@ -3377,6 +3558,39 @@ def command_toolchain(args):
         print(f"\nReport saved: {p}")
     return 0
 
+
+def command_preflight(args):
+    data = exam_preflight(args.target_file, args.capture)
+    print(json.dumps(data, indent=2))
+    if args.report:
+        p = save_report({"preflight": data}, args.report)
+        print(f"\nReport saved: {p}")
+    return 0 if data.get("status") in {"READY", "READY_WITH_WARNINGS"} else 20
+
+
+def command_completeness(args):
+    target = load_target_lock(args.target_file)
+    data = evidence_completeness(target, args.capture)
+    print(json.dumps(data, indent=2))
+    if args.report:
+        p = save_report({"evidence_completeness": data}, args.report)
+        print(f"\nReport saved: {p}")
+    return 0 if data.get("score_percent", 0) >= 45 else 21
+
+
+def command_custody(args):
+    data = chain_of_custody(
+        args.paths,
+        output=args.output,
+        target_lock_path=args.target_file,
+    )
+    print(json.dumps({
+        "output": data.get("output"),
+        "record_sha256": data.get("record_sha256"),
+        "evidence_count": data.get("evidence_count"),
+    }, indent=2))
+    return 0
+
 def command_compare(args):
     data = compare_capture_profiles(args.baseline, args.current)
     print(json.dumps(data, indent=2))
@@ -3677,6 +3891,24 @@ def build_parser():
     tc = sub.add_parser("toolchain", help="Report installed offline capture-analysis integrations.")
     tc.add_argument("--report", default="")
     tc.set_defaults(func=command_toolchain)
+
+    pf = sub.add_parser("preflight", help="Check target, tools and optional capture before an exam run.")
+    pf.add_argument("--target-file", default="wifi_target_lock.json")
+    pf.add_argument("--capture", default="")
+    pf.add_argument("--report", default="")
+    pf.set_defaults(func=command_preflight)
+
+    ec = sub.add_parser("completeness", help="Score completeness of the authorized evidence set.")
+    ec.add_argument("--target-file", default="wifi_target_lock.json")
+    ec.add_argument("--capture", default="")
+    ec.add_argument("--report", default="")
+    ec.set_defaults(func=command_completeness)
+
+    cu = sub.add_parser("custody", help="Hash evidence files into a chain-of-custody record.")
+    cu.add_argument("paths", nargs="+")
+    cu.add_argument("--output", default="chain_of_custody.json")
+    cu.add_argument("--target-file", default="wifi_target_lock.json")
+    cu.set_defaults(func=command_custody)
 
     cp = sub.add_parser("compare", help="Compare two passive capture profiles for configuration drift.")
     cp.add_argument("baseline")
