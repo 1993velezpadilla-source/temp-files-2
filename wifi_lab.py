@@ -1654,7 +1654,7 @@ def load_target_lock(path="wifi_target_lock.json"):
     return json.loads(p.read_text(encoding="utf-8"))
 
 
-def select_and_lock_target(index=None, bssid="", output="wifi_target_lock.json"):
+def select_and_lock_target(index=None, bssid="", ssid="", output="wifi_target_lock.json"):
     networks, raw = scan_networks()
     if not networks:
         return {
@@ -1664,12 +1664,29 @@ def select_and_lock_target(index=None, bssid="", output="wifi_target_lock.json")
         }
 
     target = None
+    candidates = []
     if bssid:
         wanted = normalize_mac(bssid)
         for net in networks:
             if normalize_mac(net.get("bssid")) == wanted:
                 target = net
                 break
+    elif ssid:
+        candidates = [
+            net for net in networks
+            if (net.get("ssid") or "") == ssid
+        ]
+        if len(candidates) == 1:
+            target = candidates[0]
+        elif len(candidates) > 1:
+            return {
+                "ok": False,
+                "error": "SSID is ambiguous because multiple BSSIDs are visible.",
+                "ssid": ssid,
+                "candidate_count": len(candidates),
+                "candidates": candidates,
+                "action": "Choose the intended BSSID explicitly.",
+            }
     elif index is not None:
         if 0 <= index < len(networks):
             target = networks[index]
@@ -1678,6 +1695,8 @@ def select_and_lock_target(index=None, bssid="", output="wifi_target_lock.json")
         return {
             "ok": False,
             "error": "Requested target was not present in the current scan.",
+            "requested_ssid": ssid,
+            "requested_bssid": bssid,
             "visible_networks": len(networks),
         }
 
@@ -1719,6 +1738,11 @@ def build_exam_bundle(capture_path="", target_lock_path="wifi_target_lock.json",
         payload["capture_quality"] = capture_quality(capture_path, bssid)
         payload["passive_ap_profile"] = passive_ap_profiles(capture_path)
         payload["timeline"] = capture_timeline(capture_path, bssid, max_events=500)
+        payload["channel_observations"] = channel_observation_summary(capture_path)
+        if bssid:
+            payload["target_event_timeline"] = target_event_timeline(
+                capture_path, bssid, window_seconds=15.0, max_events=500
+            )
         payload["security_findings"] = build_security_findings(
             target=target,
             passive_profile=payload["passive_ap_profile"],
@@ -2041,43 +2065,6 @@ def channel_observation_summary(path):
     return result
 
 
-def exam_bundle(target_bssid="", capture_path="", output="exam_bundle.json"):
-    networks, _ = scan_networks()
-    payload = {
-        "readiness": readiness_check(),
-        "diagnostics": adapter_diagnostics(),
-        "radio_capabilities": radio_capabilities(),
-        "local_network": local_network_info(),
-        "visible_networks": networks,
-    }
-
-    if target_bssid:
-        target_norm = normalize_mac(target_bssid)
-        payload["target_matches"] = [
-            n for n in networks
-            if normalize_mac(n.get("bssid")) == target_norm
-        ]
-
-    if capture_path:
-        payload["capture_statistics"] = capture_statistics(capture_path)
-        payload["capture_quality"] = capture_quality(capture_path, target_bssid)
-        payload["passive_ap_profile"] = passive_ap_profiles(capture_path)
-        payload["capture_analysis"] = analyze_capture(capture_path, target_bssid or None)
-        payload["channel_observations"] = channel_observation_summary(capture_path)
-        if target_bssid:
-            payload["target_timeline"] = target_event_timeline(
-                capture_path, target_bssid
-            )
-            payload["target_station_summary"] = anonymized_station_summary(
-                capture_path, target_bssid
-            )
-
-    path = save_report(payload, output)
-    return {
-        "report": str(path),
-        "payload": payload,
-    }
-
 def save_report(payload, output="wifi_lab_report.json"):
     p = Path(output)
     envelope = {
@@ -2259,7 +2246,7 @@ def command_selftest(args):
     return 0 if passed else 10
 
 def command_lock(args):
-    if args.index is None and not args.bssid:
+    if args.index is None and not args.bssid and not args.ssid:
         networks, _ = scan_networks()
         print_networks(networks)
         try:
@@ -2270,7 +2257,7 @@ def command_lock(args):
         data = select_and_lock_target(index=idx, output=args.output)
     else:
         idx = args.index - 1 if args.index is not None else None
-        data = select_and_lock_target(index=idx, bssid=args.bssid, output=args.output)
+        data = select_and_lock_target(index=idx, bssid=args.bssid, ssid=args.ssid, output=args.output)
 
     print(json.dumps(data, indent=2))
     return 0 if data.get("ok") else 2
@@ -2286,6 +2273,16 @@ def command_show_lock(args):
 
 
 def command_bundle(args):
+    if args.ssid or args.bssid:
+        locked = select_and_lock_target(
+            bssid=args.bssid,
+            ssid=args.ssid,
+            output=args.target_file,
+        )
+        if not locked.get("ok"):
+            print(json.dumps(locked, indent=2))
+            return 2
+
     data = build_exam_bundle(
         capture_path=args.capture,
         target_lock_path=args.target_file,
@@ -2317,21 +2314,6 @@ def command_channels(args):
         print(f"\nReport saved: {p}")
     return 0 if data.get("channels") else 7
 
-
-def command_bundle(args):
-    data = exam_bundle(
-        target_bssid=args.bssid,
-        capture_path=args.capture,
-        output=args.output,
-    )
-    print(json.dumps({
-        "report": data["report"],
-        "readiness": data["payload"].get("readiness", {}).get("status"),
-        "visible_network_count": len(data["payload"].get("visible_networks", [])),
-        "capture_included": bool(args.capture),
-        "target_bssid": args.bssid,
-    }, indent=2))
-    return 0
 
 def command_compare(args):
     data = compare_capture_profiles(args.baseline, args.current)
@@ -2527,6 +2509,8 @@ def build_parser():
 
     bd = sub.add_parser("bundle", help="Generate a complete exam evidence bundle from current diagnostics and an optional capture.")
     bd.add_argument("--capture", default="")
+    bd.add_argument("--ssid", default="", help="Optional exact SSID to lock before building the bundle.")
+    bd.add_argument("--bssid", default="", help="Optional BSSID to lock before building the bundle.")
     bd.add_argument("--target-file", default="wifi_target_lock.json")
     bd.add_argument("--output-dir", default="wifi_exam_bundle")
     bd.set_defaults(func=command_bundle)
@@ -2543,12 +2527,6 @@ def build_parser():
     ch.add_argument("capture")
     ch.add_argument("--report", default="")
     ch.set_defaults(func=command_channels)
-
-    bd = sub.add_parser("bundle", help="Create one exam-surprise diagnostic/evidence bundle.")
-    bd.add_argument("--bssid", default="", help="Optional selected authorized AP BSSID.")
-    bd.add_argument("--capture", default="", help="Optional authorized PCAP/PCAPNG.")
-    bd.add_argument("--output", default="exam_bundle.json")
-    bd.set_defaults(func=command_bundle)
 
     cp = sub.add_parser("compare", help="Compare two passive capture profiles for configuration drift.")
     cp.add_argument("baseline")
