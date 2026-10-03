@@ -1777,6 +1777,307 @@ def build_exam_bundle(capture_path="", target_lock_path="wifi_target_lock.json",
         "capture_included": bool(capture_path),
     }
 
+
+def _station_token(mac):
+    n = normalize_mac(mac)
+    if not n or n == "ffffffffffff":
+        return ""
+    return hashlib.sha256(n.encode("ascii")).hexdigest()[:12]
+
+
+def target_event_timeline(path, target_bssid, window_seconds=15.0, max_events=500):
+    p = Path(path)
+    result = {
+        "capture": str(p),
+        "target_bssid": target_bssid,
+        "events": [],
+        "event_counts": {},
+        "nearby_event_correlations": [],
+        "window_seconds": float(window_seconds),
+        "warnings": [],
+        "note": (
+            "Correlations are temporal observations only. They do not prove that one frame caused another."
+        ),
+    }
+
+    if not p.exists():
+        result["warnings"].append("Capture file does not exist.")
+        return result
+    if not target_bssid:
+        result["warnings"].append("A target BSSID is required.")
+        return result
+    if not tool_exists("tshark"):
+        result["warnings"].append("tshark is not installed or not on PATH.")
+        return result
+
+    available = _tshark_field_names()
+    key_info_field = _first_supported_field(available, [
+        "wlan_rsna_eapol.keydes.key_info",
+        "eapol.keydes.key_info",
+        "wlan_rsna_eapol.keydes.keyinfo",
+    ])
+
+    fields = [
+        "frame.number",
+        "frame.time_epoch",
+        "wlan.fc.type",
+        "wlan.fc.subtype",
+        "wlan.sa",
+        "wlan.da",
+        "wlan.bssid",
+        "eapol.type",
+    ]
+    if key_info_field:
+        fields.append(key_info_field)
+
+    filt = (
+        f"(wlan.bssid == {target_bssid}) && "
+        "((wlan.fc.type == 0) || eapol)"
+    )
+    cmd = [
+        "tshark", "-r", str(p),
+        "-Y", filt,
+        "-T", "fields",
+        "-E", "separator=\t",
+        "-E", "occurrence=f",
+    ]
+    for field in fields:
+        cmd += ["-e", field]
+
+    rc, out = run(cmd)
+    if rc != 0:
+        result["warnings"].append("TShark could not build the target timeline.")
+        result["tshark_output"] = out[:2000]
+        return result
+
+    subtype_names = {
+        0: "association_request",
+        1: "association_response",
+        4: "probe_request",
+        5: "probe_response",
+        8: "beacon",
+        10: "disassociation_observed",
+        11: "authentication",
+        12: "deauthentication_observed",
+    }
+    target_norm = normalize_mac(target_bssid)
+    parsed = []
+
+    for line in out.splitlines():
+        cols = line.split("\t")
+        cols += [""] * (len(fields) - len(cols))
+        row = dict(zip(fields, cols))
+
+        try:
+            epoch = float((row.get("frame.time_epoch") or "0").split(",")[0])
+        except ValueError:
+            epoch = 0.0
+
+        etype = ""
+        details = {}
+        eapol_value = (row.get("eapol.type") or "").strip()
+        if eapol_value:
+            key_info = _parse_int(row.get(key_info_field)) if key_info_field else None
+            msg = classify_key_message(key_info)
+            etype = f"eapol_m{msg}" if msg else "eapol_observed"
+            details["eapol_type"] = eapol_value
+            details["key_info"] = row.get(key_info_field, "") if key_info_field else ""
+        else:
+            try:
+                subtype = int((row.get("wlan.fc.subtype") or "-1").split(",")[0], 0)
+            except ValueError:
+                subtype = -1
+            etype = subtype_names.get(subtype, f"management_subtype_{subtype}")
+
+        sa = row.get("wlan.sa", "")
+        da = row.get("wlan.da", "")
+        station_tokens = []
+        for mac in (sa, da):
+            n = normalize_mac(mac)
+            if n and n not in {target_norm, "ffffffffffff"}:
+                tok = _station_token(mac)
+                if tok and tok not in station_tokens:
+                    station_tokens.append(tok)
+
+        event = {
+            "frame": row.get("frame.number", ""),
+            "epoch": epoch,
+            "event": etype,
+            "station_tokens": station_tokens,
+            "details": details,
+        }
+        parsed.append(event)
+
+    parsed.sort(key=lambda e: (e["epoch"], int(e["frame"] or 0)))
+    if parsed:
+        base = parsed[0]["epoch"]
+        for event in parsed:
+            event["relative_seconds"] = round(event["epoch"] - base, 6)
+
+    counts = {}
+    for event in parsed:
+        counts[event["event"]] = counts.get(event["event"], 0) + 1
+
+    disconnects = [
+        e for e in parsed
+        if e["event"] in {"deauthentication_observed", "disassociation_observed"}
+    ]
+    eapol_events = [e for e in parsed if e["event"].startswith("eapol_")]
+    correlations = []
+    for d in disconnects:
+        for e in eapol_events:
+            delta = e["epoch"] - d["epoch"]
+            if 0 <= delta <= float(window_seconds):
+                correlations.append({
+                    "disconnect_frame": d["frame"],
+                    "disconnect_event": d["event"],
+                    "eapol_frame": e["frame"],
+                    "eapol_event": e["event"],
+                    "delta_seconds": round(delta, 6),
+                    "shared_station_token": bool(
+                        set(d["station_tokens"]) & set(e["station_tokens"])
+                    ),
+                })
+                break
+
+    result["event_counts"] = counts
+    result["nearby_event_correlations"] = correlations
+    result["total_events"] = len(parsed)
+    result["events_truncated"] = len(parsed) > int(max_events)
+    result["events"] = parsed[:int(max_events)]
+    result["recognized_key_info_field"] = key_info_field or ""
+    return result
+
+
+def channel_observation_summary(path):
+    p = Path(path)
+    result = {
+        "capture": str(p),
+        "channels": [],
+        "warnings": [],
+        "note": "Passive capture counts only; this is not an RF spectrum measurement.",
+    }
+    if not p.exists():
+        result["warnings"].append("Capture file does not exist.")
+        return result
+    if not tool_exists("tshark"):
+        result["warnings"].append("tshark is not installed or not on PATH.")
+        return result
+
+    available = _tshark_field_names()
+    channel_field = _first_supported_field(available, [
+        "wlan_radio.channel",
+        "wlan.ds.current_channel",
+        "radiotap.channel.freq",
+    ])
+    signal_field = _first_supported_field(available, [
+        "radiotap.dbm_antsignal",
+        "wlan.dbm_antsignal",
+    ])
+    bssid_field = _first_supported_field(available, ["wlan.bssid"])
+
+    if not channel_field:
+        result["warnings"].append("No supported channel/frequency field was found in this TShark build.")
+        return result
+
+    fields = ["frame.number", channel_field]
+    if bssid_field:
+        fields.append(bssid_field)
+    if signal_field:
+        fields.append(signal_field)
+
+    cmd = [
+        "tshark", "-r", str(p),
+        "-T", "fields",
+        "-E", "separator=\t",
+        "-E", "occurrence=f",
+    ]
+    for field in fields:
+        cmd += ["-e", field]
+
+    rc, out = run(cmd)
+    if rc != 0:
+        result["warnings"].append("TShark could not summarize channel observations.")
+        return result
+
+    buckets = {}
+    for line in out.splitlines():
+        cols = line.split("\t")
+        cols += [""] * (len(fields) - len(cols))
+        row = dict(zip(fields, cols))
+        channel = (row.get(channel_field) or "").strip()
+        if not channel:
+            continue
+        item = buckets.setdefault(channel, {
+            "channel_or_frequency": channel,
+            "frame_count": 0,
+            "bssids": set(),
+            "signals_dbm": [],
+        })
+        item["frame_count"] += 1
+        if bssid_field:
+            b = (row.get(bssid_field) or "").strip().lower()
+            if b:
+                item["bssids"].add(b)
+        if signal_field:
+            raw = (row.get(signal_field) or "").strip()
+            if raw:
+                try:
+                    item["signals_dbm"].append(float(raw.split(",")[0]))
+                except ValueError:
+                    pass
+
+    serial = []
+    for _, item in sorted(buckets.items(), key=lambda kv: (-kv[1]["frame_count"], kv[0])):
+        signals = item.pop("signals_dbm")
+        item["bssids"] = sorted(item["bssids"])
+        item["unique_bssid_count"] = len(item["bssids"])
+        item["signal_dbm_avg"] = round(sum(signals) / len(signals), 2) if signals else None
+        serial.append(item)
+
+    result["channels"] = serial
+    result["channel_field"] = channel_field
+    result["signal_field"] = signal_field or ""
+    return result
+
+
+def exam_bundle(target_bssid="", capture_path="", output="exam_bundle.json"):
+    networks, _ = scan_networks()
+    payload = {
+        "readiness": readiness_check(),
+        "diagnostics": adapter_diagnostics(),
+        "radio_capabilities": radio_capabilities(),
+        "local_network": local_network_info(),
+        "visible_networks": networks,
+    }
+
+    if target_bssid:
+        target_norm = normalize_mac(target_bssid)
+        payload["target_matches"] = [
+            n for n in networks
+            if normalize_mac(n.get("bssid")) == target_norm
+        ]
+
+    if capture_path:
+        payload["capture_statistics"] = capture_statistics(capture_path)
+        payload["capture_quality"] = capture_quality(capture_path, target_bssid)
+        payload["passive_ap_profile"] = passive_ap_profiles(capture_path)
+        payload["capture_analysis"] = analyze_capture(capture_path, target_bssid or None)
+        payload["channel_observations"] = channel_observation_summary(capture_path)
+        if target_bssid:
+            payload["target_timeline"] = target_event_timeline(
+                capture_path, target_bssid
+            )
+            payload["target_station_summary"] = anonymized_station_summary(
+                capture_path, target_bssid
+            )
+
+    path = save_report(payload, output)
+    return {
+        "report": str(path),
+        "payload": payload,
+    }
+
 def save_report(payload, output="wifi_lab_report.json"):
     p = Path(output)
     envelope = {
@@ -1993,6 +2294,45 @@ def command_bundle(args):
     print(json.dumps(data, indent=2))
     return 0
 
+
+def command_timeline(args):
+    data = target_event_timeline(
+        args.capture,
+        args.bssid,
+        window_seconds=args.window,
+        max_events=args.max_events,
+    )
+    print(json.dumps(data, indent=2))
+    if args.report:
+        p = save_report({"target_timeline": data}, args.report)
+        print(f"\nReport saved: {p}")
+    return 0 if data.get("total_events", 0) else 6
+
+
+def command_channels(args):
+    data = channel_observation_summary(args.capture)
+    print(json.dumps(data, indent=2))
+    if args.report:
+        p = save_report({"channel_observations": data}, args.report)
+        print(f"\nReport saved: {p}")
+    return 0 if data.get("channels") else 7
+
+
+def command_bundle(args):
+    data = exam_bundle(
+        target_bssid=args.bssid,
+        capture_path=args.capture,
+        output=args.output,
+    )
+    print(json.dumps({
+        "report": data["report"],
+        "readiness": data["payload"].get("readiness", {}).get("status"),
+        "visible_network_count": len(data["payload"].get("visible_networks", [])),
+        "capture_included": bool(args.capture),
+        "target_bssid": args.bssid,
+    }, indent=2))
+    return 0
+
 def command_compare(args):
     data = compare_capture_profiles(args.baseline, args.current)
     print(json.dumps(data, indent=2))
@@ -2189,6 +2529,25 @@ def build_parser():
     bd.add_argument("--capture", default="")
     bd.add_argument("--target-file", default="wifi_target_lock.json")
     bd.add_argument("--output-dir", default="wifi_exam_bundle")
+    bd.set_defaults(func=command_bundle)
+
+    tl = sub.add_parser("timeline", help="Build a passive event timeline for one authorized AP.")
+    tl.add_argument("capture")
+    tl.add_argument("--bssid", required=True, help="Selected authorized AP BSSID.")
+    tl.add_argument("--window", type=float, default=15.0, help="Correlation window in seconds.")
+    tl.add_argument("--max-events", type=int, default=500)
+    tl.add_argument("--report", default="")
+    tl.set_defaults(func=command_timeline)
+
+    ch = sub.add_parser("channels", help="Summarize passive channel/frequency observations in a capture.")
+    ch.add_argument("capture")
+    ch.add_argument("--report", default="")
+    ch.set_defaults(func=command_channels)
+
+    bd = sub.add_parser("bundle", help="Create one exam-surprise diagnostic/evidence bundle.")
+    bd.add_argument("--bssid", default="", help="Optional selected authorized AP BSSID.")
+    bd.add_argument("--capture", default="", help="Optional authorized PCAP/PCAPNG.")
+    bd.add_argument("--output", default="exam_bundle.json")
     bd.set_defaults(func=command_bundle)
 
     cp = sub.add_parser("compare", help="Compare two passive capture profiles for configuration drift.")
