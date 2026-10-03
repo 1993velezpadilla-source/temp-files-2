@@ -1,0 +1,2 @@
+# Optional Python dependency for the second TShark-backed parsing path.
+pyshark>=0.6
