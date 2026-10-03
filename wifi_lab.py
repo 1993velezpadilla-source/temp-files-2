@@ -13,7 +13,7 @@ import zipfile
 from pathlib import Path
 
 
-APP_VERSION = "1.4"
+APP_VERSION = "1.5"
 
 
 def run(cmd):
@@ -196,6 +196,8 @@ def adapter_diagnostics():
             "tshark": tool_exists("tshark"),
             "dumpcap": tool_exists("dumpcap"),
             "capinfos": tool_exists("capinfos"),
+            "editcap": tool_exists("editcap"),
+            "mergecap": tool_exists("mergecap"),
             "tcpdump": tool_exists("tcpdump"),
             "kismet": tool_exists("kismet"),
             "kismetdb_to_pcap": tool_exists("kismetdb_to_pcap"),
@@ -411,6 +413,8 @@ def tool_version(name):
         "tshark": [[name, "--version"]],
         "dumpcap": [[name, "--version"]],
         "capinfos": [[name, "--version"]],
+        "editcap": [[name, "--version"]],
+        "mergecap": [[name, "--version"]],
         "nmcli": [[name, "--version"]],
         "iw": [[name, "--version"]],
         "kismet": [[name, "--version"]],
@@ -492,7 +496,7 @@ def readiness_check():
         status = "NOT_READY"
 
     versions = {}
-    for name in ["tshark", "dumpcap", "capinfos", "nmcli", "iw", "kismet"]:
+    for name in ["tshark", "dumpcap", "capinfos", "editcap", "mergecap", "nmcli", "iw", "kismet"]:
         v = tool_version(name)
         if v:
             versions[name] = v
@@ -762,6 +766,221 @@ def file_sha256(path):
             h.update(chunk)
     return h.hexdigest()
 
+
+
+def pyshark_availability():
+    data = {
+        "installed": False,
+        "version": "",
+        "import_error": "",
+        "tshark_available": tool_exists("tshark"),
+        "note": "Optional parsing layer; PyShark delegates packet dissection to TShark.",
+    }
+    try:
+        import pyshark  # type: ignore
+        data["installed"] = True
+        data["version"] = getattr(pyshark, "__version__", "") or ""
+    except Exception as e:
+        data["import_error"] = str(e)
+    return data
+
+
+def pyshark_capture_summary(path, target_bssid=""):
+    p = Path(path)
+    result = {
+        "capture": str(p),
+        "target_bssid": target_bssid,
+        "backend": "pyshark",
+        "available": False,
+        "packet_count": 0,
+        "eapol_count": 0,
+        "management_count": 0,
+        "layer_counts": {},
+        "warnings": [],
+    }
+    if not p.exists():
+        result["warnings"].append("Capture file does not exist.")
+        return result
+    try:
+        import pyshark  # type: ignore
+    except Exception as e:
+        result["warnings"].append(f"PyShark is not installed: {e}")
+        return result
+
+    result["available"] = True
+    display_filter = ""
+    if target_bssid:
+        display_filter = f"wlan.bssid == {target_bssid} || eapol"
+
+    cap = None
+    try:
+        cap = pyshark.FileCapture(
+            str(p),
+            display_filter=display_filter or None,
+            keep_packets=False,
+            use_json=True,
+            include_raw=False,
+        )
+        layers = {}
+        packets = 0
+        eapol = 0
+        mgmt = 0
+        for packet in cap:
+            packets += 1
+            layer_names = [getattr(layer, "layer_name", "") for layer in packet.layers]
+            for name in layer_names:
+                if name:
+                    layers[name] = layers.get(name, 0) + 1
+            if "eapol" in layer_names:
+                eapol += 1
+            try:
+                wlan = packet.wlan
+                fc_type = str(getattr(wlan, "fc_type", ""))
+                if fc_type == "0":
+                    mgmt += 1
+            except Exception:
+                pass
+
+        result["packet_count"] = packets
+        result["eapol_count"] = eapol
+        result["management_count"] = mgmt
+        result["layer_counts"] = dict(
+            sorted(layers.items(), key=lambda kv: (-kv[1], kv[0]))[:50]
+        )
+    except Exception as e:
+        result["warnings"].append(f"PyShark could not parse the capture: {e}")
+    finally:
+        try:
+            if cap is not None:
+                cap.close()
+        except Exception:
+            pass
+    return result
+
+
+def capinfos_summary(path):
+    p = Path(path)
+    result = {
+        "capture": str(p),
+        "exists": p.exists(),
+        "available": tool_exists("capinfos"),
+        "raw": "",
+        "warnings": [],
+    }
+    if not p.exists():
+        result["warnings"].append("Capture file does not exist.")
+        return result
+    if not tool_exists("capinfos"):
+        result["warnings"].append("capinfos is not installed or not on PATH.")
+        return result
+
+    rc, out = run(["capinfos", str(p)])
+    result["raw"] = out
+    result["ok"] = rc == 0
+    if rc != 0:
+        result["warnings"].append("capinfos could not inspect the capture.")
+    return result
+
+
+def merge_capture_files(inputs, output):
+    files = [Path(x) for x in inputs]
+    out = Path(output)
+    result = {
+        "inputs": [str(x) for x in files],
+        "output": str(out),
+        "tool": "mergecap",
+        "ok": False,
+        "input_hashes": {},
+        "output_sha256": "",
+        "log": "",
+    }
+    if len(files) < 2:
+        result["log"] = "At least two capture files are required."
+        return result
+    missing = [str(x) for x in files if not x.exists()]
+    if missing:
+        result["log"] = "Missing input capture(s): " + ", ".join(missing)
+        return result
+    if out.exists():
+        result["log"] = "Output already exists; refusing to overwrite it."
+        return result
+    if not tool_exists("mergecap"):
+        result["log"] = "mergecap is not installed or not on PATH."
+        return result
+
+    result["input_hashes"] = {str(x): file_sha256(x) for x in files}
+    rc, log = run(["mergecap", "-w", str(out)] + [str(x) for x in files])
+    result["log"] = log
+    result["ok"] = rc == 0 and out.exists()
+    if out.exists():
+        result["output_sha256"] = file_sha256(out)
+    return result
+
+
+def trim_capture_file(input_path, output_path, start_time="", stop_time=""):
+    src = Path(input_path)
+    out = Path(output_path)
+    result = {
+        "input": str(src),
+        "output": str(out),
+        "start_time": start_time,
+        "stop_time": stop_time,
+        "tool": "editcap",
+        "ok": False,
+        "input_sha256": "",
+        "output_sha256": "",
+        "log": "",
+    }
+    if not src.exists():
+        result["log"] = "Input capture does not exist."
+        return result
+    if out.exists():
+        result["log"] = "Output already exists; refusing to overwrite it."
+        return result
+    if not tool_exists("editcap"):
+        result["log"] = "editcap is not installed or not on PATH."
+        return result
+    if not start_time and not stop_time:
+        result["log"] = "Provide --start and/or --stop."
+        return result
+
+    cmd = ["editcap"]
+    if start_time:
+        cmd += ["-A", start_time]
+    if stop_time:
+        cmd += ["-B", stop_time]
+    cmd += [str(src), str(out)]
+
+    result["input_sha256"] = file_sha256(src)
+    rc, log = run(cmd)
+    result["log"] = log
+    result["ok"] = rc == 0 and out.exists()
+    if out.exists():
+        result["output_sha256"] = file_sha256(out)
+    return result
+
+
+def offline_toolchain_report():
+    diag = adapter_diagnostics()
+    return {
+        "timestamp": datetime.datetime.now().astimezone().isoformat(),
+        "wireshark_tools": {
+            name: {
+                "installed": bool(diag.get("tools", {}).get(name)),
+                "version": tool_version(name) if diag.get("tools", {}).get(name) else "",
+            }
+            for name in ["tshark", "dumpcap", "capinfos", "editcap", "mergecap"]
+        },
+        "kismet": {
+            "installed": bool(diag.get("tools", {}).get("kismet")),
+            "converter": tool_exists("kismetdb_to_pcap"),
+        },
+        "pyshark": pyshark_availability(),
+        "notes": [
+            "These integrations are for offline/imported evidence analysis and packaging.",
+            "No tool in this report enables password cracking or forced deauthentication.",
+        ],
+    }
 
 def local_network_info():
     system = platform.system().lower()
@@ -2019,6 +2238,7 @@ def build_exam_bundle(capture_path="", target_lock_path="wifi_target_lock.json",
         "readiness": readiness,
         "diagnostics": diagnostics,
         "radio_capabilities": radio_capabilities(),
+        "offline_toolchain": offline_toolchain_report(),
         "local_network": local,
         "neighbor_snapshot": neighbors,
         "security_findings": build_security_findings(target=target),
@@ -2028,6 +2248,8 @@ def build_exam_bundle(capture_path="", target_lock_path="wifi_target_lock.json",
         bssid = target.get("bssid", "") if target else ""
         payload["capture_doctor"] = capture_doctor(capture_path)
         payload["capture_statistics"] = capture_statistics(capture_path)
+        payload["capinfos"] = capinfos_summary(capture_path)
+        payload["pyshark_summary"] = pyshark_capture_summary(capture_path, bssid)
         payload["capture_analysis"] = analyze_capture(capture_path, bssid or None)
         payload["capture_quality"] = capture_quality(capture_path, bssid)
         payload["passive_ap_profile"] = passive_ap_profiles(capture_path)
@@ -3116,6 +3338,45 @@ def command_scan_csv(args):
     print(json.dumps(data, indent=2))
     return 0
 
+
+def command_pyshark(args):
+    data = pyshark_capture_summary(args.capture, args.bssid)
+    print(json.dumps(data, indent=2))
+    if args.report:
+        p = save_report({"pyshark_summary": data}, args.report)
+        print(f"\nReport saved: {p}")
+    return 0 if data.get("available") else 16
+
+
+def command_capinfos(args):
+    data = capinfos_summary(args.capture)
+    print(json.dumps(data, indent=2))
+    if args.report:
+        p = save_report({"capinfos": data}, args.report)
+        print(f"\nReport saved: {p}")
+    return 0 if data.get("ok") else 17
+
+
+def command_merge(args):
+    data = merge_capture_files(args.inputs, args.output)
+    print(json.dumps(data, indent=2))
+    return 0 if data.get("ok") else 18
+
+
+def command_trim(args):
+    data = trim_capture_file(args.capture, args.output, args.start, args.stop)
+    print(json.dumps(data, indent=2))
+    return 0 if data.get("ok") else 19
+
+
+def command_toolchain(args):
+    data = offline_toolchain_report()
+    print(json.dumps(data, indent=2))
+    if args.report:
+        p = save_report({"offline_toolchain": data}, args.report)
+        print(f"\nReport saved: {p}")
+    return 0
+
 def command_compare(args):
     data = compare_capture_profiles(args.baseline, args.current)
     print(json.dumps(data, indent=2))
@@ -3389,6 +3650,33 @@ def build_parser():
     scsv.add_argument("--output", default="wifi_scan.csv")
     scsv.add_argument("--query", default="", help="Optional case-insensitive SSID substring.")
     scsv.set_defaults(func=command_scan_csv)
+
+    ps = sub.add_parser("pyshark", help="Optional PyShark/TShark summary of an imported capture.")
+    ps.add_argument("capture")
+    ps.add_argument("--bssid", default="")
+    ps.add_argument("--report", default="")
+    ps.set_defaults(func=command_pyshark)
+
+    ci = sub.add_parser("capinfos", help="Run Wireshark capinfos against an imported capture.")
+    ci.add_argument("capture")
+    ci.add_argument("--report", default="")
+    ci.set_defaults(func=command_capinfos)
+
+    mg = sub.add_parser("merge", help="Merge two or more capture files chronologically with mergecap.")
+    mg.add_argument("inputs", nargs="+")
+    mg.add_argument("--output", required=True)
+    mg.set_defaults(func=command_merge)
+
+    tr = sub.add_parser("trim", help="Trim an imported capture by time range with editcap.")
+    tr.add_argument("capture")
+    tr.add_argument("--output", required=True)
+    tr.add_argument("--start", default="", help="editcap-compatible start time.")
+    tr.add_argument("--stop", default="", help="editcap-compatible stop time.")
+    tr.set_defaults(func=command_trim)
+
+    tc = sub.add_parser("toolchain", help="Report installed offline capture-analysis integrations.")
+    tc.add_argument("--report", default="")
+    tc.set_defaults(func=command_toolchain)
 
     cp = sub.add_parser("compare", help="Compare two passive capture profiles for configuration drift.")
     cp.add_argument("baseline")
