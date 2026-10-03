@@ -1,4 +1,4 @@
-# WiFi Security Lab v1.3
+# WiFi Security Lab v1.4
 
 Functions-first CLI for an authorized classroom/home Wi-Fi security assessment.
 
@@ -277,3 +277,8 @@ python wifi_lab.py pcap-index exam.pcapng --ssid "Instructor"
 \`\`\`
 
 This is passive indexing only; it does not probe or transmit to the networks.
+
+
+## Instructor-facing report
+
+The generated Markdown evidence report now includes target identity/fingerprint, target revalidation, capture-doctor status, target/capture reconciliation, technical verdict, EAPOL M1-M4 counts, capture SHA-256, environment summary and defensive findings.
