@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 
-APP_VERSION = "0.6"
+APP_VERSION = "0.7"
 
 
 def run(cmd):
@@ -1327,6 +1327,45 @@ def command_capture(args):
 
 
 
+
+def command_selftest(args):
+    checks = {}
+
+    checks["security_wpa3"] = classify_security("WPA3-Personal").get("mode") == "WPA3"
+    checks["security_wpa2"] = classify_security("WPA2-Personal").get("mode") == "WPA2"
+    checks["security_wep"] = classify_security("WEP").get("mode") == "WEP"
+    checks["mac_normalize"] = normalize_mac("AA:BB:cc:DD:ee:FF") == "aabbccddeeff"
+    checks["nmcli_split"] = _split_nmcli(r"Lab\:SSID:aa\:bb\:cc\:dd\:ee\:ff:80:6:WPA2")[:2] == [
+        "Lab:SSID", "aa:bb:cc:dd:ee:ff"
+    ]
+
+    dummy = {
+        "version": APP_VERSION,
+        "created_at": "selftest",
+        "scope": "selftest",
+        "payload": {
+            "target": {
+                "ssid": "TEST",
+                "bssid": "00:11:22:33:44:55",
+                "security": "WPA2",
+                "security_detail": {"mode": "WPA2"},
+                "channel": "6",
+                "signal": "100%",
+            }
+        },
+    }
+    md = render_markdown_report(dummy)
+    checks["markdown_render"] = "# WiFi Security Lab Report" in md and "00:11:22:33:44:55" in md
+
+    passed = all(checks.values())
+    result = {
+        "version": APP_VERSION,
+        "passed": passed,
+        "checks": checks,
+    }
+    print(json.dumps(result, indent=2))
+    return 0 if passed else 10
+
 def command_lock(args):
     if args.index is None and not args.bssid:
         networks, _ = scan_networks()
@@ -1498,6 +1537,9 @@ def build_parser():
     c.add_argument("--bssid", default="", help="Optional AP BSSID filter.")
     c.add_argument("--report", default="")
     c.set_defaults(func=command_capture)
+
+    stest = sub.add_parser("selftest", help="Run offline internal consistency checks.")
+    stest.set_defaults(func=command_selftest)
 
     lk = sub.add_parser("lock", help="Scan and persist one authorized AP as the exam target.")
     lk.add_argument("--index", type=int, default=None, help="1-based network index from the current scan.")
