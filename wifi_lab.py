@@ -13,7 +13,7 @@ import zipfile
 from pathlib import Path
 
 
-APP_VERSION = "1.3"
+APP_VERSION = "1.4"
 
 
 def run(cmd):
@@ -1213,6 +1213,64 @@ def render_markdown_report(report):
             f"| Signal | {_md_escape(target.get('signal') or '')} |",
             "",
         ]
+
+    fingerprint = payload.get("target_fingerprint")
+    if fingerprint:
+        lines += [
+            f"- Target fingerprint (SHA-256): `{_md_escape(fingerprint)}`",
+            "",
+        ]
+
+    lock_validation = payload.get("target_lock_validation")
+    if lock_validation:
+        lines += [
+            "## Target Revalidation",
+            "",
+            f"- Status: **{_md_escape(lock_validation.get('status'))}**",
+            f"- Exact BSSID visible: {bool(lock_validation.get('exact_bssid_match'))}",
+            f"- Same-SSID BSSID count: {len(lock_validation.get('same_ssid_bssids') or [])}",
+            "",
+        ]
+
+    verdict = payload.get("exam_verdict")
+    if verdict:
+        lines += [
+            "## Exam Evidence Verdict",
+            "",
+            f"- Status: **{_md_escape(verdict.get('status'))}**",
+        ]
+        for reason in verdict.get("reasons") or []:
+            lines.append(f"- {_md_escape(reason)}")
+        lines.append("")
+
+    reconciliation = payload.get("target_capture_reconciliation")
+    if reconciliation:
+        lines += [
+            "## Target / Capture Reconciliation",
+            "",
+            f"- Status: **{_md_escape(reconciliation.get('status'))}**",
+        ]
+        checks = reconciliation.get("checks") or {}
+        for key, value in checks.items():
+            lines.append(f"- {key}: {_md_escape(value)}")
+        lines.append("")
+
+    doctor = payload.get("capture_doctor")
+    if doctor:
+        lines += [
+            "## Capture Doctor",
+            "",
+            f"- Status: **{_md_escape(doctor.get('status'))}**",
+            f"- 802.11 frames: {doctor.get('wlan_frame_count')}",
+            f"- Radiotap frames: {doctor.get('radiotap_frame_count')}",
+            f"- EAPOL frames: {doctor.get('eapol_frame_count')}",
+            f"- Malformed frames: {doctor.get('malformed_frame_count')}",
+            "",
+        ]
+        for warning in doctor.get("warnings") or []:
+            lines.append(f"- Warning: {_md_escape(warning)}")
+        if doctor.get("warnings"):
+            lines.append("")
 
     readiness = payload.get("readiness") or payload.get("diagnostics")
     if readiness:
