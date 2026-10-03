@@ -1,0 +1,2 @@
+# No pip runtime dependencies.
+# External optional dependency for capture analysis: Wireshark/TShark.
