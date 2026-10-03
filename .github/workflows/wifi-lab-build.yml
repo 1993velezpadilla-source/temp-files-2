@@ -22,6 +22,8 @@ jobs:
         run: python -m py_compile wifi_lab.py
       - name: CLI help smoke test
         run: python wifi_lab.py --help
+      - name: Offline self-test
+        run: python wifi_lab.py selftest
 
   windows-exe:
     runs-on: windows-latest
