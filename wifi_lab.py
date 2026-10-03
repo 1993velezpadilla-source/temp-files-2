@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 
-APP_VERSION = "0.5"
+APP_VERSION = "0.6"
 
 
 def run(cmd):
@@ -1129,6 +1129,140 @@ def export_markdown_from_json(json_path, output_path=""):
     out.write_text(render_markdown_report(data), encoding="utf-8")
     return out
 
+
+def save_target_lock(target, output="wifi_target_lock.json"):
+    p = Path(output)
+    data = {
+        "created_at": datetime.datetime.now().astimezone().isoformat(),
+        "ssid": target.get("ssid", ""),
+        "bssid": target.get("bssid", ""),
+        "security": target.get("security", ""),
+        "security_detail": target.get("security_detail", {}),
+        "channel": target.get("channel", ""),
+        "signal": target.get("signal", ""),
+        "source": target.get("source", ""),
+    }
+    p.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return p
+
+
+def load_target_lock(path="wifi_target_lock.json"):
+    p = Path(path)
+    if not p.exists():
+        return {}
+    return json.loads(p.read_text(encoding="utf-8"))
+
+
+def select_and_lock_target(index=None, bssid="", output="wifi_target_lock.json"):
+    networks, raw = scan_networks()
+    if not networks:
+        return {
+            "ok": False,
+            "error": "No networks found.",
+            "scan_error_excerpt": raw[:500],
+        }
+
+    target = None
+    if bssid:
+        wanted = normalize_mac(bssid)
+        for net in networks:
+            if normalize_mac(net.get("bssid")) == wanted:
+                target = net
+                break
+    elif index is not None:
+        if 0 <= index < len(networks):
+            target = networks[index]
+
+    if target is None:
+        return {
+            "ok": False,
+            "error": "Requested target was not present in the current scan.",
+            "visible_networks": len(networks),
+        }
+
+    p = save_target_lock(target, output)
+    return {
+        "ok": True,
+        "target": target,
+        "lock_file": str(p),
+    }
+
+
+def build_exam_bundle(capture_path="", target_lock_path="wifi_target_lock.json", output_dir="wifi_exam_bundle"):
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    target = load_target_lock(target_lock_path)
+    networks, scan_raw = scan_networks()
+    readiness = readiness_check()
+    diagnostics = adapter_diagnostics()
+    local = local_network_info()
+    neighbors = neighbor_snapshot()
+
+    payload = {
+        "target": target,
+        "scan": networks,
+        "readiness": readiness,
+        "diagnostics": diagnostics,
+        "local_network": local,
+        "neighbor_snapshot": neighbors,
+    }
+
+    if capture_path:
+        bssid = target.get("bssid", "") if target else ""
+        payload["capture_statistics"] = capture_statistics(capture_path)
+        payload["capture_analysis"] = analyze_capture(capture_path, bssid or None)
+        payload["capture_quality"] = capture_quality(capture_path, bssid)
+        payload["passive_ap_profile"] = passive_ap_profiles(capture_path)
+        if bssid:
+            payload["target_station_summary"] = anonymized_station_summary(capture_path, bssid)
+
+    report_path = out / "exam_bundle.json"
+    envelope = {
+        "app": "WiFi Security Lab",
+        "version": APP_VERSION,
+        "created_at": datetime.datetime.now().astimezone().isoformat(),
+        "scope": "Authorized classroom/home-lab auditing",
+        "payload": payload,
+        "safety": {
+            "password_cracking": False,
+            "forced_deauthentication": False,
+            "credential_extraction": False,
+        },
+    }
+    report_path.write_text(json.dumps(envelope, indent=2), encoding="utf-8")
+
+    md_path = out / "exam_bundle.md"
+    md_path.write_text(render_markdown_report(envelope), encoding="utf-8")
+
+    manifest = {
+        "created_at": envelope["created_at"],
+        "app_version": APP_VERSION,
+        "target_lock": target_lock_path,
+        "capture": capture_path,
+        "capture_sha256": (
+            file_sha256(capture_path)
+            if capture_path and Path(capture_path).exists()
+            else ""
+        ),
+        "files": {
+            "json_report": str(report_path),
+            "markdown_report": str(md_path),
+        },
+        "scan_error_excerpt": scan_raw[:500] if not networks else "",
+    }
+    manifest_path = out / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    return {
+        "output_dir": str(out),
+        "json_report": str(report_path),
+        "markdown_report": str(md_path),
+        "manifest": str(manifest_path),
+        "target": target,
+        "capture_included": bool(capture_path),
+    }
+
 def save_report(payload, output="wifi_lab_report.json"):
     p = Path(output)
     envelope = {
@@ -1191,6 +1325,43 @@ def command_capture(args):
 
 
 
+
+
+def command_lock(args):
+    if args.index is None and not args.bssid:
+        networks, _ = scan_networks()
+        print_networks(networks)
+        try:
+            idx = int(input("\nSelect authorized lab target: ")) - 1
+        except ValueError:
+            print("Invalid selection.")
+            return 2
+        data = select_and_lock_target(index=idx, output=args.output)
+    else:
+        idx = args.index - 1 if args.index is not None else None
+        data = select_and_lock_target(index=idx, bssid=args.bssid, output=args.output)
+
+    print(json.dumps(data, indent=2))
+    return 0 if data.get("ok") else 2
+
+
+def command_show_lock(args):
+    data = load_target_lock(args.target_file)
+    if not data:
+        print("No target lock found.")
+        return 2
+    print(json.dumps(data, indent=2))
+    return 0
+
+
+def command_bundle(args):
+    data = build_exam_bundle(
+        capture_path=args.capture,
+        target_lock_path=args.target_file,
+        output_dir=args.output_dir,
+    )
+    print(json.dumps(data, indent=2))
+    return 0
 
 def command_compare(args):
     data = compare_capture_profiles(args.baseline, args.current)
@@ -1327,6 +1498,22 @@ def build_parser():
     c.add_argument("--bssid", default="", help="Optional AP BSSID filter.")
     c.add_argument("--report", default="")
     c.set_defaults(func=command_capture)
+
+    lk = sub.add_parser("lock", help="Scan and persist one authorized AP as the exam target.")
+    lk.add_argument("--index", type=int, default=None, help="1-based network index from the current scan.")
+    lk.add_argument("--bssid", default="", help="Lock a currently visible BSSID.")
+    lk.add_argument("--output", default="wifi_target_lock.json")
+    lk.set_defaults(func=command_lock)
+
+    sl = sub.add_parser("show-lock", help="Display the persisted authorized target.")
+    sl.add_argument("--target-file", default="wifi_target_lock.json")
+    sl.set_defaults(func=command_show_lock)
+
+    bd = sub.add_parser("bundle", help="Generate a complete exam evidence bundle from current diagnostics and an optional capture.")
+    bd.add_argument("--capture", default="")
+    bd.add_argument("--target-file", default="wifi_target_lock.json")
+    bd.add_argument("--output-dir", default="wifi_exam_bundle")
+    bd.set_defaults(func=command_bundle)
 
     cp = sub.add_parser("compare", help="Compare two passive capture profiles for configuration drift.")
     cp.add_argument("baseline")
