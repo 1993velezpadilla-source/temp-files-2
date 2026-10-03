@@ -1,4 +1,4 @@
-# WiFi Security Lab v0.4
+# WiFi Security Lab v1.1
 
 Functions-first CLI for an authorized classroom/home Wi-Fi security assessment.
 
@@ -30,6 +30,36 @@ Functions-first CLI for an authorized classroom/home Wi-Fi security assessment.
 - Local neighbor-table snapshot without active host scanning.
 - Tool-version inventory for reproducibility.
 - Automatic Windows EXE build pipeline plus Python compile/smoke checks.
+
+
+## Exam-surprise workflow
+
+The CLI now supports a practical unknown-SSID exam flow without hardcoding the instructor's AP:
+
+- \`find <name>\`: exact/partial SSID search, sorted by observed signal.
+- \`lock\`: persist one authorized BSSID so later analysis cannot silently switch targets.
+- \`watch\`: repeat normal OS scans and document whether the locked AP remains visible.
+- \`reconcile <capture>\`: compare the persisted AP identity with imported capture evidence.
+- \`verdict <capture>\`: return \`PASS\`, \`PARTIAL\`, \`MISMATCH\`, \`NO_CORE_EVIDENCE\`, or \`INCONCLUSIVE\`.
+- \`timeline\` / \`target-timeline\`: passive management/EAPOL event chronology.
+- \`channels\` / \`capture-channels\`: channel/security observations.
+- \`findings\`: defensive configuration findings.
+- \`bundle\`: produce a complete evidence folder.
+- \`verify-bundle\`: verify bundle hashes.
+- \`zip-bundle\`: package the evidence folder.
+- \`scan-csv\`: export the current OS scan for quick instructor review.
+
+Examples:
+
+\`\`\`
+python wifi_lab.py find Profesor --exact
+python wifi_lab.py lock --bssid AA:BB:CC:DD:EE:FF
+python wifi_lab.py reconcile exam.pcapng --report reconcile.json
+python wifi_lab.py verdict exam.pcapng --report verdict.json
+python wifi_lab.py scan-csv --output visible_networks.csv
+\`\`\`
+
+The strongest-signal result is shown only as a convenience hint. Multi-AP and mesh networks may expose several BSSIDs for the same SSID, so the intended BSSID should be explicitly locked when the instructor identifies it.
 
 ## Intentionally not implemented
 
