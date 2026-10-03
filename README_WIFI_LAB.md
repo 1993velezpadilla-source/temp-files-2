@@ -1,4 +1,4 @@
-# WiFi Security Lab v1.1
+# WiFi Security Lab v1.2
 
 Functions-first CLI for an authorized classroom/home Wi-Fi security assessment.
 
@@ -224,3 +224,34 @@ python wifi_lab.py neighbors
 ## Windows executable
 
 GitHub Actions now performs a Python compile check and CLI smoke test, then packages `wifi_lab.py` as a one-file Windows executable with PyInstaller.
+
+
+## One-shot exam run
+
+When the instructor gives only the network name, use the exact SSID:
+
+\`\`\`
+python wifi_lab.py exam-run --ssid "InstructorNetwork"
+\`\`\`
+
+If the SSID maps to more than one BSSID, the command stops instead of guessing. Re-run with the instructor-designated BSSID:
+
+\`\`\`
+python wifi_lab.py exam-run --bssid AA:BB:CC:DD:EE:FF
+\`\`\`
+
+If an authorized capture is available:
+
+\`\`\`
+python wifi_lab.py exam-run --bssid AA:BB:CC:DD:EE:FF --capture exam.pcapng
+\`\`\`
+
+This produces a persistent target lock, target fingerprint, current-scan validation, evidence bundle, capture reconciliation, and technical exam verdict.
+
+To re-check the target later:
+
+\`\`\`
+python wifi_lab.py validate-lock
+\`\`\`
+
+A channel change does not automatically mean the target is wrong; APs can change channels. A BSSID/SSID mismatch is treated more seriously.
