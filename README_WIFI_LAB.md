@@ -294,3 +294,38 @@ Possible statuses include:
 - `NO_DISCONNECT_FRAMES_OBSERVED`
 
 This command is passive only. It does not transmit deauthentication or disassociation frames.
+
+
+## Verified final result
+
+The app can validate and display an externally supplied authorized exam result against the locked SSID/BSSID.
+
+Expected JSON shape:
+
+```json
+{
+  "target_ssid": "SSID_NAME",
+  "target_bssid": "AA:BB:CC:DD:EE:FF",
+  "result_value": "AUTHORIZED_RESULT"
+}
+```
+
+Validate it directly:
+
+```bash
+python wifi_lab.py final-result result.json --target-file wifi_target_lock.json --report final_result_report.json
+```
+
+Include it in the full exam bundle:
+
+```bash
+python wifi_lab.py bundle --capture exam.pcapng --result-file result.json
+```
+
+Or include it during the one-shot exam flow:
+
+```bash
+python wifi_lab.py exam-run --ssid "SSID_NAME" --capture exam.pcapng --result-file result.json
+```
+
+When the target matches, the JSON, Markdown and HTML reports show the verified result value and SHA-256. The module validates/displays a supplied result; it does not generate that result by brute-force or forced disconnect behavior.
