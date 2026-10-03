@@ -1,6 +1,7 @@
 import argparse
 import datetime
 import json
+import hashlib
 import platform
 import re
 import shutil
@@ -9,7 +10,7 @@ import sys
 from pathlib import Path
 
 
-APP_VERSION = "0.2"
+APP_VERSION = "0.3"
 
 
 def run(cmd):
@@ -191,6 +192,7 @@ def adapter_diagnostics():
         "tools": {
             "tshark": tool_exists("tshark"),
             "dumpcap": tool_exists("dumpcap"),
+            "capinfos": tool_exists("capinfos"),
             "nmcli": tool_exists("nmcli"),
             "iw": tool_exists("iw"),
             "netsh": tool_exists("netsh"),
@@ -394,6 +396,354 @@ def analyze_capture(path, target_bssid=None):
     return result
 
 
+
+def file_sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fp:
+        for chunk in iter(lambda: fp.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def local_network_info():
+    system = platform.system().lower()
+    data = {
+        "platform": platform.system(),
+        "gateway": "",
+        "commands": {},
+    }
+
+    if "windows" in system:
+        commands = {
+            "ipconfig": ["ipconfig", "/all"],
+            "route_ipv4": ["route", "print", "-4"],
+            "wlan_interfaces": ["netsh", "wlan", "show", "interfaces"],
+        }
+    elif "linux" in system:
+        commands = {
+            "ip_addr": ["ip", "addr"],
+            "ip_route": ["ip", "route"],
+            "nmcli_general": ["nmcli", "-t", "-f", "GENERAL.DEVICE,GENERAL.TYPE,GENERAL.STATE,IP4.ADDRESS,IP4.GATEWAY", "device", "show"],
+        }
+    else:
+        commands = {}
+
+    for name, cmd in commands.items():
+        rc, out = run(cmd)
+        data["commands"][name] = {"ok": rc == 0, "output": out}
+
+    route_text = "\n".join(v["output"] for v in data["commands"].values())
+    gateway_patterns = [
+        r"Default Gateway[ .:]*([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)",
+        r"\bdefault\s+via\s+([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)",
+        r"IP4\.GATEWAY[^:]*:([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)",
+    ]
+    for pattern in gateway_patterns:
+        m = re.search(pattern, route_text, re.I)
+        if m:
+            data["gateway"] = m.group(1)
+            break
+
+    return data
+
+
+def _count_tshark_filter(path, display_filter):
+    if not tool_exists("tshark"):
+        return None
+    rc, out = run([
+        "tshark", "-r", str(path),
+        "-Y", display_filter,
+        "-T", "fields",
+        "-e", "frame.number",
+    ])
+    if rc != 0:
+        return None
+    return sum(1 for line in out.splitlines() if line.strip())
+
+
+def capture_statistics(path):
+    p = Path(path)
+    data = {
+        "capture": str(p),
+        "exists": p.exists(),
+        "size_bytes": p.stat().st_size if p.exists() else 0,
+        "sha256": file_sha256(p) if p.exists() else "",
+        "frame_count": 0,
+        "first_epoch": "",
+        "last_epoch": "",
+        "duration_seconds": None,
+        "management_counts": {},
+        "tool_support": {
+            "tshark": tool_exists("tshark"),
+            "capinfos": tool_exists("capinfos"),
+        },
+    }
+    if not p.exists() or not tool_exists("tshark"):
+        return data
+
+    rc, out = run([
+        "tshark", "-r", str(p),
+        "-T", "fields",
+        "-e", "frame.number",
+        "-e", "frame.time_epoch",
+    ])
+    if rc == 0:
+        epochs = []
+        frames = 0
+        for line in out.splitlines():
+            if not line.strip():
+                continue
+            cols = line.split("\t")
+            frames += 1
+            if len(cols) > 1 and cols[1].strip():
+                try:
+                    epochs.append(float(cols[1].split(",")[0]))
+                except ValueError:
+                    pass
+        data["frame_count"] = frames
+        if epochs:
+            data["first_epoch"] = f"{min(epochs):.6f}"
+            data["last_epoch"] = f"{max(epochs):.6f}"
+            data["duration_seconds"] = round(max(epochs) - min(epochs), 6)
+
+    subtype_filters = {
+        "association_request": "wlan.fc.type == 0 && wlan.fc.subtype == 0",
+        "association_response": "wlan.fc.type == 0 && wlan.fc.subtype == 1",
+        "probe_request": "wlan.fc.type == 0 && wlan.fc.subtype == 4",
+        "probe_response": "wlan.fc.type == 0 && wlan.fc.subtype == 5",
+        "beacon": "wlan.fc.type == 0 && wlan.fc.subtype == 8",
+        "disassociation_observed": "wlan.fc.type == 0 && wlan.fc.subtype == 10",
+        "authentication": "wlan.fc.type == 0 && wlan.fc.subtype == 11",
+        "deauthentication_observed": "wlan.fc.type == 0 && wlan.fc.subtype == 12",
+    }
+    for name, filt in subtype_filters.items():
+        data["management_counts"][name] = _count_tshark_filter(p, filt)
+
+    return data
+
+
+def _field_value(row, field):
+    return (row.get(field, "") or "").strip()
+
+
+def passive_ap_profiles(path):
+    p = Path(path)
+    result = {
+        "capture": str(p),
+        "aps": [],
+        "ssid_groups": [],
+        "warnings": [],
+        "privacy": "Station identifiers are counted/anonymized; this report does not expose client MAC addresses.",
+    }
+
+    if not p.exists():
+        result["warnings"].append("Capture file does not exist.")
+        return result
+    if not tool_exists("tshark"):
+        result["warnings"].append("tshark is not installed or not on PATH.")
+        return result
+
+    available = _tshark_field_names()
+    candidates = {
+        "ssid": ["wlan.ssid"],
+        "bssid": ["wlan.bssid"],
+        "source": ["wlan.sa"],
+        "destination": ["wlan.da"],
+        "signal": ["radiotap.dbm_antsignal", "wlan.dbm_antsignal"],
+        "channel": ["wlan.ds.current_channel", "radiotap.channel.freq"],
+        "mfpc": ["wlan.rsn.capabilities.mfpc", "wlan_mgt.rsn.capabilities.mfpc"],
+        "mfpr": ["wlan.rsn.capabilities.mfpr", "wlan_mgt.rsn.capabilities.mfpr"],
+        "akm": ["wlan.rsn.akms.type", "wlan_mgt.rsn.akms.type"],
+        "pairwise_cipher": ["wlan.rsn.pcs.type", "wlan_mgt.rsn.pcs.type"],
+        "group_cipher": ["wlan.rsn.gcs.type", "wlan_mgt.rsn.gcs.type"],
+        "wps_locked": ["wps.ap_setup_locked"],
+        "wps_methods": ["wps.config_methods"],
+    }
+    fields = {}
+    for logical, options in candidates.items():
+        chosen = _first_supported_field(available, options)
+        if chosen:
+            fields[logical] = chosen
+
+    required = [fields.get("ssid"), fields.get("bssid")]
+    if not all(required):
+        result["warnings"].append("This TShark build does not expose wlan.ssid/wlan.bssid as expected.")
+        return result
+
+    ordered = list(dict.fromkeys(fields.values()))
+    cmd = [
+        "tshark", "-r", str(p),
+        "-Y", "wlan.fc.type == 0 && (wlan.fc.subtype == 8 || wlan.fc.subtype == 5)",
+        "-T", "fields",
+        "-E", "separator=\t",
+        "-E", "occurrence=f",
+    ]
+    for field in ordered:
+        cmd += ["-e", field]
+
+    rc, out = run(cmd)
+    if rc != 0:
+        result["warnings"].append("TShark could not parse management frames.")
+        return result
+
+    profiles = {}
+    for line in out.splitlines():
+        cols = line.split("\t")
+        cols += [""] * (len(ordered) - len(cols))
+        row = dict(zip(ordered, cols))
+        bssid = _field_value(row, fields["bssid"]).lower()
+        if not bssid:
+            continue
+
+        prof = profiles.setdefault(bssid, {
+            "bssid": bssid,
+            "ssids": set(),
+            "hidden_ssid_observed": False,
+            "signals_dbm": [],
+            "channels": set(),
+            "pmf_capable": set(),
+            "pmf_required": set(),
+            "akm_types": set(),
+            "pairwise_cipher_types": set(),
+            "group_cipher_types": set(),
+            "wps_advertised": False,
+            "wps_setup_locked_values": set(),
+            "wps_config_methods": set(),
+            "management_observations": 0,
+        })
+        prof["management_observations"] += 1
+
+        ssid = _field_value(row, fields["ssid"])
+        if ssid:
+            prof["ssids"].add(ssid)
+        else:
+            prof["hidden_ssid_observed"] = True
+
+        if fields.get("signal"):
+            raw = _field_value(row, fields["signal"])
+            if raw:
+                try:
+                    prof["signals_dbm"].append(float(raw.split(",")[0]))
+                except ValueError:
+                    pass
+
+        if fields.get("channel"):
+            value = _field_value(row, fields["channel"])
+            if value:
+                prof["channels"].add(value)
+
+        for logical, target in [
+            ("mfpc", "pmf_capable"),
+            ("mfpr", "pmf_required"),
+            ("akm", "akm_types"),
+            ("pairwise_cipher", "pairwise_cipher_types"),
+            ("group_cipher", "group_cipher_types"),
+            ("wps_locked", "wps_setup_locked_values"),
+            ("wps_methods", "wps_config_methods"),
+        ]:
+            if fields.get(logical):
+                value = _field_value(row, fields[logical])
+                if value:
+                    prof[target].add(value)
+
+        if fields.get("wps_locked") and _field_value(row, fields["wps_locked"]):
+            prof["wps_advertised"] = True
+        if fields.get("wps_methods") and _field_value(row, fields["wps_methods"]):
+            prof["wps_advertised"] = True
+
+    serial = []
+    for bssid, prof in sorted(profiles.items()):
+        signals = prof.pop("signals_dbm")
+        prof["signal_dbm_min"] = min(signals) if signals else None
+        prof["signal_dbm_max"] = max(signals) if signals else None
+        prof["signal_dbm_avg"] = round(sum(signals) / len(signals), 2) if signals else None
+
+        for key in [
+            "ssids", "channels", "pmf_capable", "pmf_required",
+            "akm_types", "pairwise_cipher_types", "group_cipher_types",
+            "wps_setup_locked_values", "wps_config_methods",
+        ]:
+            prof[key] = sorted(prof[key])
+
+        if prof["pmf_required"] and any(v in {"1", "true", "True"} for v in prof["pmf_required"]):
+            prof["pmf_summary"] = "REQUIRED"
+        elif prof["pmf_capable"] and any(v in {"1", "true", "True"} for v in prof["pmf_capable"]):
+            prof["pmf_summary"] = "CAPABLE_NOT_CONFIRMED_REQUIRED"
+        else:
+            prof["pmf_summary"] = "NOT_CONFIRMED"
+
+        serial.append(prof)
+
+    result["aps"] = serial
+
+    groups = {}
+    for prof in serial:
+        for ssid in prof["ssids"]:
+            g = groups.setdefault(ssid, {"ssid": ssid, "bssids": [], "security_signatures": set()})
+            g["bssids"].append(prof["bssid"])
+            signature = (
+                tuple(prof["akm_types"]),
+                tuple(prof["pairwise_cipher_types"]),
+                tuple(prof["group_cipher_types"]),
+                prof["pmf_summary"],
+                prof["wps_advertised"],
+            )
+            g["security_signatures"].add(repr(signature))
+
+    for ssid, g in sorted(groups.items()):
+        signatures = g.pop("security_signatures")
+        g["bssid_count"] = len(g["bssids"])
+        g["multiple_bssids"] = g["bssid_count"] > 1
+        g["configuration_inconsistency"] = len(signatures) > 1
+        g["note"] = (
+            "Multiple BSSIDs for one SSID can be normal in multi-AP/mesh deployments. "
+            "Configuration inconsistency means the observed security properties differ and should be reviewed."
+            if g["multiple_bssids"] else ""
+        )
+        result["ssid_groups"].append(g)
+
+    result["supported_fields_used"] = fields
+    return result
+
+
+def anonymized_station_summary(path, target_bssid):
+    p = Path(path)
+    result = {
+        "capture": str(p),
+        "target_bssid": target_bssid,
+        "unique_station_count": 0,
+        "station_tokens": [],
+        "note": "Tokens are one-way SHA-256 prefixes, not client MAC addresses.",
+    }
+    if not p.exists() or not tool_exists("tshark") or not target_bssid:
+        return result
+
+    rc, out = run([
+        "tshark", "-r", str(p),
+        "-Y", f"wlan.bssid == {target_bssid}",
+        "-T", "fields",
+        "-E", "separator=\t",
+        "-e", "wlan.sa",
+        "-e", "wlan.da",
+        "-e", "wlan.bssid",
+    ])
+    if rc != 0:
+        return result
+
+    b = normalize_mac(target_bssid)
+    stations = set()
+    for line in out.splitlines():
+        cols = line.split("\t") + ["", "", ""]
+        for mac in cols[:2]:
+            n = normalize_mac(mac)
+            if n and n != b and n != "ffffffffffff":
+                stations.add(n)
+
+    tokens = sorted(hashlib.sha256(s.encode("ascii")).hexdigest()[:12] for s in stations)
+    result["unique_station_count"] = len(tokens)
+    result["station_tokens"] = tokens
+    return result
+
 def save_report(payload, output="wifi_lab_report.json"):
     p = Path(output)
     envelope = {
@@ -454,6 +804,35 @@ def command_capture(args):
     return 0 if data.get("eapol_frame_count", 0) else 3
 
 
+
+def command_netinfo(args):
+    data = local_network_info()
+    print(json.dumps(data, indent=2))
+    if args.report:
+        p = save_report({"local_network": data}, args.report)
+        print(f"\nReport saved: {p}")
+    return 0
+
+
+def command_stats(args):
+    data = capture_statistics(args.capture)
+    print(json.dumps(data, indent=2))
+    if args.report:
+        p = save_report({"capture_statistics": data}, args.report)
+        print(f"\nReport saved: {p}")
+    return 0 if data.get("exists") else 2
+
+
+def command_profile(args):
+    data = passive_ap_profiles(args.capture)
+    if args.bssid:
+        data["target_station_summary"] = anonymized_station_summary(args.capture, args.bssid)
+    print(json.dumps(data, indent=2))
+    if args.report:
+        p = save_report({"passive_profile": data}, args.report)
+        print(f"\nReport saved: {p}")
+    return 0 if data.get("aps") else 3
+
 def command_interactive(args):
     print(f"\nWIFI SECURITY LAB v{APP_VERSION}\n")
     networks, _ = scan_networks()
@@ -479,12 +858,16 @@ def command_interactive(args):
     payload = {
         "target": target,
         "diagnostics": adapter_diagnostics(),
+        "local_network": local_network_info(),
     }
 
     capture = input("\nOptional PCAP/PCAPNG path (Enter to skip): ").strip()
     if capture:
         analysis = analyze_capture(capture, target.get("bssid"))
         payload["capture_analysis"] = analysis
+        payload["capture_statistics"] = capture_statistics(capture)
+        payload["passive_ap_profile"] = passive_ap_profiles(capture)
+        payload["target_station_summary"] = anonymized_station_summary(capture, target.get("bssid"))
         print("\nCAPTURE ANALYSIS")
         print(f"EAPOL frames: {analysis.get('eapol_frame_count', 0)}")
         print(f"Handshake evidence: {analysis.get('handshake_evidence')}")
@@ -515,6 +898,21 @@ def build_parser():
     c.add_argument("--bssid", default="", help="Optional AP BSSID filter.")
     c.add_argument("--report", default="")
     c.set_defaults(func=command_capture)
+
+    n = sub.add_parser("netinfo", help="Collect local interface/gateway diagnostics.")
+    n.add_argument("--report", default="")
+    n.set_defaults(func=command_netinfo)
+
+    st = sub.add_parser("stats", help="Summarize an imported capture without modifying the network.")
+    st.add_argument("capture")
+    st.add_argument("--report", default="")
+    st.set_defaults(func=command_stats)
+
+    pr = sub.add_parser("profile", help="Build passive AP security profiles from a capture.")
+    pr.add_argument("capture")
+    pr.add_argument("--bssid", default="", help="Optional target AP for anonymized station counts.")
+    pr.add_argument("--report", default="")
+    pr.set_defaults(func=command_profile)
 
     i = sub.add_parser("interactive", help="Scan, select a target and optionally analyze a capture.")
     i.add_argument("--report", default="wifi_lab_report.json")
