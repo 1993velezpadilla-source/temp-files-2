@@ -1485,6 +1485,24 @@ def render_markdown_report(report):
             "",
         ]
 
+    final_result = payload.get("final_result")
+    if final_result:
+        lines += [
+            "## Final Result",
+            "",
+            f"- Status: **{_md_escape(final_result.get('status'))}**",
+            f"- Target SSID: {_md_escape(final_result.get('target_ssid') or '')}",
+            f"- Target BSSID: {_md_escape(final_result.get('target_bssid') or '')}",
+        ]
+        if final_result.get("status") == "RESULT_VERIFIED":
+            lines += [
+                f"- Result value: **{_md_escape(final_result.get('result_value'))}**",
+                f"- Result SHA-256: {_md_escape(final_result.get('result_sha256'))}",
+            ]
+        for warning in final_result.get("warnings") or []:
+            lines.append(f"- Warning: {_md_escape(warning)}")
+        lines.append("")
+
     fingerprint = payload.get("target_fingerprint")
     if fingerprint:
         lines += [
@@ -1673,6 +1691,7 @@ def render_html_report(report):
     findings = payload.get("security_findings") or []
     stats = payload.get("capture_statistics") or {}
     readiness = payload.get("readiness") or {}
+    final_result = payload.get("final_result") or {}
 
     def row(label, value):
         return (
@@ -1718,6 +1737,20 @@ def render_html_report(report):
         row("Duration (seconds)", stats.get("duration_seconds")),
     ])
 
+    final_result_rows = "".join([
+        row("Status", final_result.get("status")),
+        row("Target SSID", final_result.get("target_ssid")),
+        row("Target BSSID", final_result.get("target_bssid")),
+        row(
+            "Result value",
+            final_result.get("result_value")
+            if final_result.get("status") == "RESULT_VERIFIED"
+            else ""
+        ),
+        row("Result SHA-256", final_result.get("result_sha256")),
+        row("Source SHA-256", final_result.get("source_sha256")),
+    ])
+
     readiness_rows = "".join([
         row("Readiness", readiness.get("status")),
         row("Visible networks", readiness.get("network_count_visible")),
@@ -1757,6 +1790,7 @@ code{word-break:break-all}
 </header>
 <section><h2>Authorized Target</h2><table>""" + target_rows + """</table></section>
 <section><h2>Environment Readiness</h2><table>""" + readiness_rows + """</table></section>
+<section><h2>Final Result</h2><table>""" + final_result_rows + """</table></section>
 <section><h2>Evidence Result</h2><table>""" + capture_rows + """</table></section>
 <section><h2>EAPOL Key Messages Observed</h2><table>""" + eapol_rows + """</table></section>
 <section><h2>Security Findings</h2>
@@ -2229,7 +2263,7 @@ def validate_target_lock_against_scan(target_lock_path="wifi_target_lock.json"):
     return result
 
 
-def exam_run(ssid="", bssid="", capture_path="", target_file="wifi_target_lock.json", output_dir="wifi_exam_bundle"):
+def exam_run(ssid="", bssid="", capture_path="", target_file="wifi_target_lock.json", output_dir="wifi_exam_bundle", result_file=""):
     if not ssid and not bssid:
         return {
             "ok": False,
@@ -2254,9 +2288,16 @@ def exam_run(ssid="", bssid="", capture_path="", target_file="wifi_target_lock.j
         capture_path=capture_path,
         target_lock_path=target_file,
         output_dir=output_dir,
+        result_file=result_file,
     )
 
     verdict = None
+    if result_file:
+        payload["final_result"] = load_verified_exam_result(
+            result_file,
+            target=target,
+        )
+
     if capture_path:
         verdict = exam_verdict(lock.get("target"), capture_path)
 
@@ -2270,7 +2311,7 @@ def exam_run(ssid="", bssid="", capture_path="", target_file="wifi_target_lock.j
         "bundle": bundle,
     }
 
-def build_exam_bundle(capture_path="", target_lock_path="wifi_target_lock.json", output_dir="wifi_exam_bundle"):
+def build_exam_bundle(capture_path="", target_lock_path="wifi_target_lock.json", output_dir="wifi_exam_bundle", result_file=""):
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
@@ -3621,6 +3662,7 @@ def command_bundle(args):
         capture_path=args.capture,
         target_lock_path=args.target_file,
         output_dir=args.output_dir,
+        result_file=args.result_file,
     )
     print(json.dumps(data, indent=2))
     return 0
@@ -3643,6 +3685,7 @@ def command_exam_run(args):
         capture_path=args.capture,
         target_file=args.target_file,
         output_dir=args.output_dir,
+        result_file=args.result_file,
     )
     print(json.dumps(data, indent=2))
     return 0 if data.get("ok") else 13
@@ -4063,6 +4106,7 @@ def build_parser():
     er.add_argument("--capture", default="", help="Optional authorized PCAP/PCAPNG.")
     er.add_argument("--target-file", default="wifi_target_lock.json")
     er.add_argument("--output-dir", default="wifi_exam_bundle")
+    er.add_argument("--result-file", default="", help="Optional verified exam-result JSON.")
     er.set_defaults(func=command_exam_run)
 
     bd = sub.add_parser("bundle", help="Generate a complete exam evidence bundle from current diagnostics and an optional capture.")
@@ -4071,6 +4115,7 @@ def build_parser():
     bd.add_argument("--bssid", default="", help="Optional BSSID to lock before building the bundle.")
     bd.add_argument("--target-file", default="wifi_target_lock.json")
     bd.add_argument("--output-dir", default="wifi_exam_bundle")
+    bd.add_argument("--result-file", default="", help="Optional verified exam-result JSON.")
     bd.set_defaults(func=command_bundle)
 
     tl = sub.add_parser("target-timeline", help="Build a passive event timeline for one authorized AP.")
