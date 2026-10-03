@@ -1,4 +1,4 @@
-# WiFi Security Lab v1.4
+# WiFi Security Lab v1.5
 
 Functions-first CLI for an authorized classroom/home Wi-Fi security assessment.
 
@@ -61,6 +61,11 @@ No GUI work is required for this flow.
 - Manifest with SHA-256 hashes.
 - Bundle integrity verification.
 - ZIP packaging of the completed bundle.
+- Optional PyShark parser summary as a second TShark-backed view.
+- `capinfos` metadata inspection.
+- `mergecap` support to combine multiple authorized captures chronologically.
+- `editcap` support to trim an imported capture by time range.
+- Offline toolchain inventory for Wireshark/Kismet/PyShark components.
 
 ## Intentionally not implemented
 
@@ -203,3 +208,38 @@ Normal Wi-Fi scanning and raw 802.11 capture are different capabilities. A lapto
 ## Development priority
 
 Core behavior first. GUI polish comes after the CLI, evidence pipeline and packaging path are stable.
+
+
+## Additional offline tooling
+
+Inspect available analysis components:
+
+```bash
+python wifi_lab.py toolchain
+```
+
+Optional PyShark summary:
+
+```bash
+python wifi_lab.py pyshark exam.pcapng --bssid AA:BB:CC:DD:EE:FF
+```
+
+Wireshark capture metadata:
+
+```bash
+python wifi_lab.py capinfos exam.pcapng
+```
+
+Merge multiple authorized captures:
+
+```bash
+python wifi_lab.py merge part1.pcapng part2.pcapng --output combined.pcapng
+```
+
+Trim a capture to a relevant time window:
+
+```bash
+python wifi_lab.py trim combined.pcapng --output focused.pcapng --start "2026-10-03 09:10:00" --stop "2026-10-03 09:15:00"
+```
+
+These operations are offline evidence-processing utilities. They do not transmit Wi-Fi frames.
