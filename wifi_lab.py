@@ -982,6 +982,58 @@ def offline_toolchain_report():
         ],
     }
 
+
+def passive_live_capture(interface, output="passive_live.pcapng", duration_seconds=60, target_bssid=""):
+    out = Path(output)
+    result = {
+        "interface": str(interface),
+        "output": str(out),
+        "duration_seconds": int(duration_seconds),
+        "target_bssid": target_bssid,
+        "ok": False,
+        "capture_sha256": "",
+        "capture_statistics": {},
+        "capture_analysis": {},
+        "warnings": [],
+        "note": (
+            "Passive capture only. This command does not enable monitor mode, "
+            "transmit deauthentication frames, disconnect clients, or alter the interface."
+        ),
+    }
+
+    if not tool_exists("tshark"):
+        result["warnings"].append("tshark is not installed or not on PATH.")
+        return result
+
+    try:
+        duration = max(1, min(int(duration_seconds), 600))
+    except Exception:
+        duration = 60
+    result["duration_seconds"] = duration
+
+    if out.exists():
+        result["warnings"].append("Output already exists; refusing to overwrite it.")
+        return result
+
+    rc, log = run([
+        "tshark",
+        "-i", str(interface),
+        "-a", f"duration:{duration}",
+        "-w", str(out),
+    ])
+    result["tshark_exit_code"] = rc
+    result["tshark_log"] = log[-4000:]
+
+    if not out.exists():
+        result["warnings"].append("No capture file was produced.")
+        return result
+
+    result["capture_sha256"] = file_sha256(out)
+    result["capture_statistics"] = capture_statistics(out)
+    result["capture_analysis"] = analyze_capture(out, target_bssid or None)
+    result["ok"] = rc == 0 or result["capture_statistics"].get("frame_count", 0) > 0
+    return result
+
 def local_network_info():
     system = platform.system().lower()
     data = {
@@ -3714,6 +3766,20 @@ def command_deauth_observe(args):
         print(f"\nReport saved: {p}")
     return 0 if data.get("status") != "NOT_ANALYZED" else 22
 
+
+def command_passive_live(args):
+    data = passive_live_capture(
+        interface=args.interface,
+        output=args.output,
+        duration_seconds=args.duration,
+        target_bssid=args.bssid,
+    )
+    print(json.dumps(data, indent=2))
+    if args.report:
+        p = save_report({"passive_live_capture": data}, args.report)
+        print(f"\nReport saved: {p}")
+    return 0 if data.get("ok") else 20
+
 def command_compare(args):
     data = compare_capture_profiles(args.baseline, args.current)
     print(json.dumps(data, indent=2))
@@ -4039,6 +4105,14 @@ def build_parser():
     dao.add_argument("--window", type=float, default=15.0, help="Correlation window in seconds.")
     dao.add_argument("--report", default="")
     dao.set_defaults(func=command_deauth_observe)
+
+    plc = sub.add_parser("passive-live", help="Passively capture for a fixed time on an already-prepared interface, then analyze EAPOL evidence.")
+    plc.add_argument("--interface", required=True, help="TShark interface index/name from 'tshark -D'.")
+    plc.add_argument("--output", default="passive_live.pcapng")
+    plc.add_argument("--duration", type=int, default=60, help="Capture duration in seconds, max 600.")
+    plc.add_argument("--bssid", default="", help="Optional authorized AP BSSID for post-capture EAPOL filtering.")
+    plc.add_argument("--report", default="")
+    plc.set_defaults(func=command_passive_live)
 
     cp = sub.add_parser("compare", help="Compare two passive capture profiles for configuration drift.")
     cp.add_argument("baseline")
