@@ -1,4 +1,4 @@
-# WiFi Security Lab v1.5
+# WiFi Security Lab v1.6
 
 Functions-first CLI for an authorized classroom/home Wi-Fi security assessment.
 
@@ -66,6 +66,9 @@ No GUI work is required for this flow.
 - `mergecap` support to combine multiple authorized captures chronologically.
 - `editcap` support to trim an imported capture by time range.
 - Offline toolchain inventory for Wireshark/Kismet/PyShark components.
+- Exam preflight that reports blockers and warnings before the run.
+- Evidence-completeness score for the locked AP/capture set.
+- Chain-of-custody JSON with SHA-256 hashes for evidence/report files.
 
 ## Intentionally not implemented
 
@@ -165,6 +168,7 @@ wifi_exam_bundle/
   exam_bundle.md
   exam_bundle.html
   manifest.json
+  chain_of_custody.json
 ```
 
 Verify the hashes:
@@ -243,3 +247,32 @@ python wifi_lab.py trim combined.pcapng --output focused.pcapng --start "2026-10
 ```
 
 These operations are offline evidence-processing utilities. They do not transmit Wi-Fi frames.
+
+
+## Exam preflight
+
+Run this before trusting the machine or capture:
+
+```bash
+python wifi_lab.py preflight --capture exam.pcapng
+```
+
+It reports READY, READY_WITH_WARNINGS, or BLOCKED and lists the exact blockers.
+
+## Evidence completeness
+
+```bash
+python wifi_lab.py completeness --capture exam.pcapng
+```
+
+The percentage measures how complete the authorized evidence set is. It is **not** a password-recovery probability.
+
+## Chain of custody
+
+Hash one or more evidence files:
+
+```bash
+python wifi_lab.py custody exam.pcapng wifi_exam_bundle/exam_bundle.json --output chain_of_custody.json
+```
+
+The record includes SHA-256 hashes, file sizes, timestamps, host/runtime metadata, target fingerprint, and its own record hash.
