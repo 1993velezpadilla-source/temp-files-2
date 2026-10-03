@@ -11,7 +11,7 @@ import zipfile
 from pathlib import Path
 
 
-APP_VERSION = "0.9"
+APP_VERSION = "1.0"
 
 
 def run(cmd):
@@ -1269,6 +1269,34 @@ def render_markdown_report(report):
             f"- Duration: {stats.get('duration_seconds')} seconds",
         ]
 
+    chsum = payload.get("channel_security_summary")
+    if chsum:
+        lines += [
+            "",
+            "## Environment Summary",
+            "",
+            f"- Networks visible: {chsum.get('network_count', 0)}",
+        ]
+        if chsum.get("security_modes"):
+            lines.append("- Security modes:")
+            for item in chsum["security_modes"]:
+                lines.append(f"  - {item.get('mode')}: {item.get('network_count')}")
+
+    timeline = payload.get("timeline")
+    if timeline:
+        lines += [
+            "",
+            "## Event Timeline",
+            "",
+            f"- Events recorded: {timeline.get('event_count', 0)}",
+            f"- Truncated: {timeline.get('truncated', False)}",
+        ]
+        for event in (timeline.get("events") or [])[:30]:
+            lines.append(
+                f"- frame {event.get('frame')}: {event.get('event')} "
+                f"{event.get('source')} -> {event.get('destination')}"
+            )
+
     findings = payload.get("security_findings") or []
     if findings:
         lines += [
@@ -1301,6 +1329,137 @@ def export_markdown_from_json(json_path, output_path=""):
     return out
 
 
+
+
+def channel_security_summary(networks=None):
+    if networks is None:
+        networks, _ = scan_networks()
+
+    channels = {}
+    security = {}
+    for net in networks:
+        ch = str(net.get("channel") or "unknown")
+        mode = (net.get("security_detail") or {}).get("mode") or net.get("security") or "UNKNOWN"
+        channels[ch] = channels.get(ch, 0) + 1
+        security[mode] = security.get(mode, 0) + 1
+
+    def channel_key(item):
+        key = item[0]
+        try:
+            return (0, int(key))
+        except ValueError:
+            return (1, key)
+
+    return {
+        "network_count": len(networks),
+        "channels": [
+            {"channel": ch, "network_count": count}
+            for ch, count in sorted(channels.items(), key=channel_key)
+        ],
+        "security_modes": [
+            {"mode": mode, "network_count": count}
+            for mode, count in sorted(security.items())
+        ],
+    }
+
+
+def _station_token(mac, target_bssid=""):
+    n = normalize_mac(mac)
+    if not n:
+        return ""
+    if target_bssid and n == normalize_mac(target_bssid):
+        return "TARGET_AP"
+    if n == "ffffffffffff":
+        return "BROADCAST"
+    return "STA-" + hashlib.sha256(n.encode("ascii")).hexdigest()[:10]
+
+
+def capture_timeline(path, target_bssid="", max_events=500):
+    p = Path(path)
+    result = {
+        "capture": str(p),
+        "target_bssid": target_bssid,
+        "max_events": max_events,
+        "events": [],
+        "truncated": False,
+        "warnings": [],
+        "privacy": "Non-target station MAC addresses are replaced with one-way tokens.",
+    }
+    if not p.exists():
+        result["warnings"].append("Capture file does not exist.")
+        return result
+    if not tool_exists("tshark"):
+        result["warnings"].append("tshark is not installed or not on PATH.")
+        return result
+
+    available = _tshark_field_names()
+    fields = [
+        "frame.number",
+        "frame.time_epoch",
+        "wlan.fc.type",
+        "wlan.fc.subtype",
+        "wlan.sa",
+        "wlan.da",
+        "wlan.bssid",
+        "eapol.type",
+    ]
+    fields = [x for x in fields if x in available or x in {
+        "frame.number", "frame.time_epoch", "wlan.sa", "wlan.da", "wlan.bssid", "eapol.type"
+    }]
+
+    filt = "(wlan.fc.type == 0) || eapol"
+    if target_bssid:
+        filt = f"(({filt}) && (wlan.bssid == {target_bssid} || eapol))"
+
+    cmd = [
+        "tshark", "-r", str(p),
+        "-Y", filt,
+        "-T", "fields",
+        "-E", "separator=\t",
+        "-E", "occurrence=f",
+    ]
+    for field in fields:
+        cmd += ["-e", field]
+
+    rc, out = run(cmd)
+    if rc != 0:
+        result["warnings"].append("TShark could not build the event timeline.")
+        return result
+
+    subtype_names = {
+        "0": "association_request",
+        "1": "association_response",
+        "4": "probe_request",
+        "5": "probe_response",
+        "8": "beacon",
+        "10": "disassociation_observed",
+        "11": "authentication",
+        "12": "deauthentication_observed",
+    }
+
+    for line in out.splitlines():
+        cols = line.split("\t")
+        cols += [""] * (len(fields) - len(cols))
+        row = dict(zip(fields, cols))
+
+        eapol = row.get("eapol.type", "")
+        subtype = row.get("wlan.fc.subtype", "")
+        event_type = "eapol" if eapol else subtype_names.get(subtype, "management")
+        event = {
+            "frame": row.get("frame.number", ""),
+            "time_epoch": row.get("frame.time_epoch", ""),
+            "event": event_type,
+            "source": _station_token(row.get("wlan.sa", ""), target_bssid),
+            "destination": _station_token(row.get("wlan.da", ""), target_bssid),
+            "bssid": "TARGET_AP" if target_bssid and normalize_mac(row.get("wlan.bssid", "")) == normalize_mac(target_bssid) else row.get("wlan.bssid", ""),
+        }
+        result["events"].append(event)
+        if len(result["events"]) >= max_events:
+            result["truncated"] = True
+            break
+
+    result["event_count"] = len(result["events"])
+    return result
 
 def build_security_findings(target=None, passive_profile=None, target_bssid=""):
     findings = []
@@ -1544,6 +1703,7 @@ def build_exam_bundle(capture_path="", target_lock_path="wifi_target_lock.json",
     payload = {
         "target": target,
         "scan": networks,
+        "channel_security_summary": channel_security_summary(networks),
         "readiness": readiness,
         "diagnostics": diagnostics,
         "radio_capabilities": radio_capabilities(),
@@ -1558,6 +1718,7 @@ def build_exam_bundle(capture_path="", target_lock_path="wifi_target_lock.json",
         payload["capture_analysis"] = analyze_capture(capture_path, bssid or None)
         payload["capture_quality"] = capture_quality(capture_path, bssid)
         payload["passive_ap_profile"] = passive_ap_profiles(capture_path)
+        payload["timeline"] = capture_timeline(capture_path, bssid, max_events=500)
         payload["security_findings"] = build_security_findings(
             target=target,
             passive_profile=payload["passive_ap_profile"],
@@ -1682,6 +1843,25 @@ def command_capture(args):
 
 
 
+
+
+def command_channels(args):
+    networks, _ = scan_networks()
+    data = channel_security_summary(networks)
+    print(json.dumps(data, indent=2))
+    if args.report:
+        p = save_report({"channel_security_summary": data}, args.report)
+        print(f"\nReport saved: {p}")
+    return 0 if networks else 2
+
+
+def command_timeline(args):
+    data = capture_timeline(args.capture, args.bssid, args.max_events)
+    print(json.dumps(data, indent=2))
+    if args.report:
+        p = save_report({"timeline": data}, args.report)
+        print(f"\nReport saved: {p}")
+    return 0 if data.get("event_count", 0) else 3
 
 def command_findings(args):
     target = load_target_lock(args.target_file)
@@ -1948,6 +2128,17 @@ def build_parser():
     c.add_argument("--bssid", default="", help="Optional AP BSSID filter.")
     c.add_argument("--report", default="")
     c.set_defaults(func=command_capture)
+
+    ch = sub.add_parser("channels", help="Summarize visible networks by channel and security mode.")
+    ch.add_argument("--report", default="")
+    ch.set_defaults(func=command_channels)
+
+    tl = sub.add_parser("timeline", help="Build an anonymized management/EAPOL event timeline from a capture.")
+    tl.add_argument("capture")
+    tl.add_argument("--bssid", default="")
+    tl.add_argument("--max-events", type=int, default=500)
+    tl.add_argument("--report", default="")
+    tl.set_defaults(func=command_timeline)
 
     fd = sub.add_parser("findings", help="Generate defensive findings from the locked target and optional passive capture.")
     fd.add_argument("--capture", default="")
