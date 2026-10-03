@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 
-APP_VERSION = "0.7"
+APP_VERSION = "0.8"
 
 
 def run(cmd):
@@ -195,6 +195,7 @@ def adapter_diagnostics():
             "capinfos": tool_exists("capinfos"),
             "tcpdump": tool_exists("tcpdump"),
             "kismet": tool_exists("kismet"),
+            "kismetdb_to_pcap": tool_exists("kismetdb_to_pcap"),
             "nmcli": tool_exists("nmcli"),
             "iw": tool_exists("iw"),
             "netsh": tool_exists("netsh"),
@@ -595,6 +596,161 @@ def capture_quality(path, target_bssid=""):
             (profile.get("warnings") or []) + (handshake.get("warnings") or [])
         )),
     }
+
+
+def radio_capabilities():
+    system = platform.system().lower()
+    data = {
+        "platform": platform.system(),
+        "monitor_mode_detected": None,
+        "monitor_mode_evidence": [],
+        "capture_linktypes": {},
+        "notes": [],
+    }
+
+    if "linux" in system and tool_exists("iw"):
+        rc, out = run(["iw", "list"])
+        data["iw_list_ok"] = rc == 0
+        if rc == 0:
+            in_modes = False
+            monitor = False
+            for raw in out.splitlines():
+                stripped = raw.strip()
+                if stripped == "Supported interface modes:":
+                    in_modes = True
+                    continue
+                if in_modes:
+                    if raw and not raw.startswith("\t") and not raw.startswith(" "):
+                        in_modes = False
+                    elif stripped.startswith("*"):
+                        mode = stripped.lstrip("*").strip()
+                        if mode:
+                            data["monitor_mode_evidence"].append(mode)
+                        if mode == "monitor":
+                            monitor = True
+            data["monitor_mode_detected"] = monitor
+        else:
+            data["notes"].append("iw list failed; monitor-mode capability was not determined.")
+
+    elif "windows" in system:
+        if tool_exists("netsh"):
+            rc, out = run(["netsh", "wlan", "show", "drivers"])
+            data["netsh_driver_query_ok"] = rc == 0
+            data["driver_excerpt"] = out[:4000]
+        data["notes"].append(
+            "Windows raw 802.11 capture support is driver-dependent; a normal Wi-Fi scan does not prove monitor-mode capability."
+        )
+
+    elif "darwin" in system:
+        data["notes"].append(
+            "macOS monitor/raw-capture capability depends on interface and OS permissions; this checker does not change interface mode."
+        )
+
+    if tool_exists("dumpcap"):
+        rc, out = run(["dumpcap", "-D"])
+        if rc == 0:
+            interfaces = []
+            for line in out.splitlines():
+                m = re.match(r"\s*(\d+)\.\s+(.*)", line)
+                if m:
+                    interfaces.append((m.group(1), m.group(2).strip()))
+            for idx, desc in interfaces[:20]:
+                lrc, lout = run(["dumpcap", "-L", "-i", idx])
+                if lrc == 0:
+                    data["capture_linktypes"][idx] = {
+                        "interface": desc,
+                        "linktypes": [x.strip() for x in lout.splitlines() if x.strip()],
+                    }
+
+    data["kismet_detected"] = tool_exists("kismet")
+    data["kismetdb_converter_detected"] = tool_exists("kismetdb_to_pcap")
+    data["note"] = "Capability inspection only; this command does not enable monitor mode or alter the interface."
+    return data
+
+
+def convert_kismetdb(input_path, output_path=""):
+    src = Path(input_path)
+    out = Path(output_path) if output_path else src.with_suffix(".pcapng")
+    result = {
+        "input": str(src),
+        "output": str(out),
+        "tool": "kismetdb_to_pcap",
+        "ok": False,
+        "input_sha256_before": "",
+        "input_sha256_after": "",
+        "output_sha256": "",
+        "output_exists": False,
+        "log": "",
+    }
+    if not src.exists():
+        result["log"] = "Input KismetDB file does not exist."
+        return result
+    if not tool_exists("kismetdb_to_pcap"):
+        result["log"] = "kismetdb_to_pcap is not installed or not on PATH."
+        return result
+    if out.exists():
+        result["log"] = "Output already exists; refusing to overwrite it."
+        return result
+
+    result["input_sha256_before"] = file_sha256(src)
+    rc, log = run([
+        "kismetdb_to_pcap",
+        "--in", str(src),
+        "--out", str(out),
+        "--skip-clean",
+    ])
+    result["log"] = log
+    result["input_sha256_after"] = file_sha256(src) if src.exists() else ""
+    result["output_exists"] = out.exists()
+    if out.exists():
+        result["output_sha256"] = file_sha256(out)
+    result["ok"] = (
+        rc == 0
+        and out.exists()
+        and result["input_sha256_before"] == result["input_sha256_after"]
+    )
+    return result
+
+
+def minimize_capture(input_path, output_path, target_bssid=""):
+    src = Path(input_path)
+    out = Path(output_path)
+    result = {
+        "input": str(src),
+        "output": str(out),
+        "target_bssid": target_bssid,
+        "ok": False,
+        "input_sha256": "",
+        "output_sha256": "",
+        "filter": "",
+        "log": "",
+    }
+    if not src.exists():
+        result["log"] = "Input capture does not exist."
+        return result
+    if not tool_exists("tshark"):
+        result["log"] = "tshark is not installed or not on PATH."
+        return result
+    if out.exists():
+        result["log"] = "Output already exists; refusing to overwrite it."
+        return result
+
+    filt = "(wlan.fc.type == 0) || eapol"
+    if target_bssid:
+        filt = f"(({filt}) && (wlan.bssid == {target_bssid} || eapol))"
+
+    result["filter"] = filt
+    result["input_sha256"] = file_sha256(src)
+    rc, log = run([
+        "tshark", "-r", str(src),
+        "-Y", filt,
+        "-w", str(out),
+    ])
+    result["log"] = log
+    if out.exists():
+        result["output_sha256"] = file_sha256(out)
+    result["ok"] = rc == 0 and out.exists()
+    return result
 
 def file_sha256(path):
     h = hashlib.sha256()
@@ -1204,6 +1360,7 @@ def build_exam_bundle(capture_path="", target_lock_path="wifi_target_lock.json",
         "scan": networks,
         "readiness": readiness,
         "diagnostics": diagnostics,
+        "radio_capabilities": radio_capabilities(),
         "local_network": local,
         "neighbor_snapshot": neighbors,
     }
@@ -1327,6 +1484,33 @@ def command_capture(args):
 
 
 
+
+
+def command_radio(args):
+    data = radio_capabilities()
+    print(json.dumps(data, indent=2))
+    if args.report:
+        p = save_report({"radio_capabilities": data}, args.report)
+        print(f"\nReport saved: {p}")
+    return 0
+
+
+def command_kismet_import(args):
+    data = convert_kismetdb(args.input, args.output)
+    print(json.dumps(data, indent=2))
+    if args.report:
+        p = save_report({"kismet_import": data}, args.report)
+        print(f"\nReport saved: {p}")
+    return 0 if data.get("ok") else 6
+
+
+def command_minimize(args):
+    data = minimize_capture(args.input, args.output, args.bssid)
+    print(json.dumps(data, indent=2))
+    if args.report:
+        p = save_report({"capture_minimization": data}, args.report)
+        print(f"\nReport saved: {p}")
+    return 0 if data.get("ok") else 7
 
 def command_selftest(args):
     checks = {}
@@ -1537,6 +1721,23 @@ def build_parser():
     c.add_argument("--bssid", default="", help="Optional AP BSSID filter.")
     c.add_argument("--report", default="")
     c.set_defaults(func=command_capture)
+
+    radio = sub.add_parser("radio", help="Inspect capture/monitor-mode capability without changing interface mode.")
+    radio.add_argument("--report", default="")
+    radio.set_defaults(func=command_radio)
+
+    ki = sub.add_parser("kismet-import", help="Convert an existing KismetDB log to PCAP-NG without cleaning the source.")
+    ki.add_argument("input")
+    ki.add_argument("--output", default="")
+    ki.add_argument("--report", default="")
+    ki.set_defaults(func=command_kismet_import)
+
+    mn = sub.add_parser("minimize", help="Create an evidence-minimized PCAP containing management/EAPOL observations.")
+    mn.add_argument("input")
+    mn.add_argument("output")
+    mn.add_argument("--bssid", default="", help="Optional authorized AP BSSID.")
+    mn.add_argument("--report", default="")
+    mn.set_defaults(func=command_minimize)
 
     stest = sub.add_parser("selftest", help="Run offline internal consistency checks.")
     stest.set_defaults(func=command_selftest)
