@@ -13,7 +13,7 @@ import zipfile
 from pathlib import Path
 
 
-APP_VERSION = "1.1"
+APP_VERSION = "1.2"
 
 
 def run(cmd):
@@ -1710,6 +1710,111 @@ def select_and_lock_target(index=None, bssid="", ssid="", output="wifi_target_lo
     }
 
 
+
+def target_fingerprint(target):
+    target = target or {}
+    canonical = "|".join([
+        str(target.get("ssid") or "").strip(),
+        normalize_mac(target.get("bssid")),
+        str(target.get("security") or "").strip().upper(),
+    ])
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def validate_target_lock_against_scan(target_lock_path="wifi_target_lock.json"):
+    target = load_target_lock(target_lock_path)
+    networks, raw = scan_networks()
+    result = {
+        "target_file": target_lock_path,
+        "target": target,
+        "target_fingerprint": target_fingerprint(target) if target else "",
+        "status": "NO_TARGET",
+        "exact_bssid_match": None,
+        "same_ssid_bssids": [],
+        "security_changed": None,
+        "channel_changed": None,
+        "scan_error_excerpt": raw[:500] if not networks else "",
+    }
+    if not target:
+        return result
+
+    wanted_bssid = normalize_mac(target.get("bssid"))
+    wanted_ssid = str(target.get("ssid") or "")
+    exact = None
+    same_ssid = []
+
+    for net in networks:
+        if wanted_ssid and str(net.get("ssid") or "") == wanted_ssid:
+            same_ssid.append(net)
+        if wanted_bssid and normalize_mac(net.get("bssid")) == wanted_bssid:
+            exact = net
+
+    result["same_ssid_bssids"] = same_ssid
+    result["exact_bssid_match"] = exact
+
+    if exact:
+        old_sec = str(target.get("security") or "").strip().upper()
+        new_sec = str(exact.get("security") or "").strip().upper()
+        old_ch = str(target.get("channel") or "").strip()
+        new_ch = str(exact.get("channel") or "").strip()
+        result["security_changed"] = bool(old_sec and new_sec and old_sec != new_sec)
+        result["channel_changed"] = bool(old_ch and new_ch and old_ch != new_ch)
+
+        if result["security_changed"]:
+            result["status"] = "SEEN_SECURITY_CHANGED"
+        elif result["channel_changed"]:
+            result["status"] = "SEEN_CHANNEL_CHANGED"
+        else:
+            result["status"] = "SEEN_EXACT"
+    elif same_ssid:
+        result["status"] = "SSID_SEEN_BSSID_MISSING"
+    else:
+        result["status"] = "NOT_SEEN"
+
+    return result
+
+
+def exam_run(ssid="", bssid="", capture_path="", target_file="wifi_target_lock.json", output_dir="wifi_exam_bundle"):
+    if not ssid and not bssid:
+        return {
+            "ok": False,
+            "status": "TARGET_REQUIRED",
+            "error": "Provide the instructor-designated SSID or BSSID.",
+        }
+
+    lock = select_and_lock_target(
+        bssid=bssid,
+        ssid=ssid,
+        output=target_file,
+    )
+    if not lock.get("ok"):
+        return {
+            "ok": False,
+            "status": "TARGET_LOCK_FAILED",
+            "lock": lock,
+        }
+
+    validation = validate_target_lock_against_scan(target_file)
+    bundle = build_exam_bundle(
+        capture_path=capture_path,
+        target_lock_path=target_file,
+        output_dir=output_dir,
+    )
+
+    verdict = None
+    if capture_path:
+        verdict = exam_verdict(lock.get("target"), capture_path)
+
+    return {
+        "ok": True,
+        "status": "COMPLETE_WITH_CAPTURE" if capture_path else "TARGET_LOCKED_NO_CAPTURE",
+        "target": lock.get("target"),
+        "target_fingerprint": target_fingerprint(lock.get("target")),
+        "target_validation": validation,
+        "verdict": verdict,
+        "bundle": bundle,
+    }
+
 def build_exam_bundle(capture_path="", target_lock_path="wifi_target_lock.json", output_dir="wifi_exam_bundle"):
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -1723,6 +1828,8 @@ def build_exam_bundle(capture_path="", target_lock_path="wifi_target_lock.json",
 
     payload = {
         "target": target,
+        "target_fingerprint": target_fingerprint(target) if target else "",
+        "target_lock_validation": validate_target_lock_against_scan(target_lock_path) if target else {"status": "NO_TARGET"},
         "scan": networks,
         "channel_security_summary": channel_security_summary(networks),
         "readiness": readiness,
@@ -1752,6 +1859,8 @@ def build_exam_bundle(capture_path="", target_lock_path="wifi_target_lock.json",
         )
         if bssid:
             payload["target_station_summary"] = anonymized_station_summary(capture_path, bssid)
+        payload["target_capture_reconciliation"] = reconcile_target_with_capture(target, capture_path) if target else {"status": "NO_TARGET"}
+        payload["exam_verdict"] = exam_verdict(target, capture_path) if target else {"status": "NO_TARGET"}
 
     report_path = out / "exam_bundle.json"
     envelope = {
@@ -2571,6 +2680,27 @@ def command_bundle(args):
     return 0
 
 
+
+def command_validate_lock(args):
+    data = validate_target_lock_against_scan(args.target_file)
+    print(json.dumps(data, indent=2))
+    if args.report:
+        p = save_report({"target_lock_validation": data}, args.report)
+        print(f"\nReport saved: {p}")
+    return 0 if data.get("status") in {"SEEN_EXACT", "SEEN_CHANNEL_CHANGED"} else 12
+
+
+def command_exam_run(args):
+    data = exam_run(
+        ssid=args.ssid,
+        bssid=args.bssid,
+        capture_path=args.capture,
+        target_file=args.target_file,
+        output_dir=args.output_dir,
+    )
+    print(json.dumps(data, indent=2))
+    return 0 if data.get("ok") else 13
+
 def command_target_timeline(args):
     data = target_event_timeline(
         args.capture,
@@ -2838,6 +2968,19 @@ def build_parser():
     sl = sub.add_parser("show-lock", help="Display the persisted authorized target.")
     sl.add_argument("--target-file", default="wifi_target_lock.json")
     sl.set_defaults(func=command_show_lock)
+
+    vl = sub.add_parser("validate-lock", help="Re-scan and verify that the persisted authorized AP is still the same target.")
+    vl.add_argument("--target-file", default="wifi_target_lock.json")
+    vl.add_argument("--report", default="")
+    vl.set_defaults(func=command_validate_lock)
+
+    er = sub.add_parser("exam-run", help="One-shot exam flow: scan, exact target lock, validation, bundle, and optional capture verdict.")
+    er.add_argument("--ssid", default="", help="Exact instructor-designated SSID.")
+    er.add_argument("--bssid", default="", help="Instructor-designated BSSID when known.")
+    er.add_argument("--capture", default="", help="Optional authorized PCAP/PCAPNG.")
+    er.add_argument("--target-file", default="wifi_target_lock.json")
+    er.add_argument("--output-dir", default="wifi_exam_bundle")
+    er.set_defaults(func=command_exam_run)
 
     bd = sub.add_parser("bundle", help="Generate a complete exam evidence bundle from current diagnostics and an optional capture.")
     bd.add_argument("--capture", default="")
