@@ -7,10 +7,11 @@ import re
 import shutil
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 
-APP_VERSION = "0.8"
+APP_VERSION = "0.9"
 
 
 def run(cmd):
@@ -1268,6 +1269,20 @@ def render_markdown_report(report):
             f"- Duration: {stats.get('duration_seconds')} seconds",
         ]
 
+    findings = payload.get("security_findings") or []
+    if findings:
+        lines += [
+            "",
+            "## Defensive Findings",
+            "",
+        ]
+        for item in findings:
+            lines.append(
+                f"- **{_md_escape(item.get('severity'))}** "
+                f"{_md_escape(item.get('finding'))} "
+                f"Recommendation: {_md_escape(item.get('recommendation'))}"
+            )
+
     lines += [
         "",
         "## Scope Note",
@@ -1285,6 +1300,177 @@ def export_markdown_from_json(json_path, output_path=""):
     out.write_text(render_markdown_report(data), encoding="utf-8")
     return out
 
+
+
+def build_security_findings(target=None, passive_profile=None, target_bssid=""):
+    findings = []
+    target = target or {}
+    mode = (target.get("security_detail") or {}).get("mode") or target.get("security") or ""
+    mode_upper = str(mode).upper()
+
+    if mode_upper == "WEP":
+        findings.append({
+            "severity": "HIGH",
+            "category": "legacy_security",
+            "finding": "WEP detected.",
+            "recommendation": "Replace WEP with WPA2-AES or WPA3 and rotate credentials.",
+        })
+    elif mode_upper == "WPA":
+        findings.append({
+            "severity": "HIGH",
+            "category": "legacy_security",
+            "finding": "Legacy WPA detected.",
+            "recommendation": "Migrate to WPA2-AES or WPA3 and disable legacy TKIP where possible.",
+        })
+    elif mode_upper.startswith("OPEN"):
+        findings.append({
+            "severity": "HIGH",
+            "category": "unencrypted_network",
+            "finding": "Open or unclassified protection was reported by the operating-system scan.",
+            "recommendation": "Confirm the AP configuration and enable modern authenticated encryption if this is not an intentional guest network.",
+        })
+    elif mode_upper == "WPA2":
+        findings.append({
+            "severity": "INFO",
+            "category": "security_mode",
+            "finding": "WPA2 detected.",
+            "recommendation": "Prefer AES/CCMP, disable legacy compatibility modes, and use a strong unique passphrase.",
+        })
+    elif mode_upper == "WPA3":
+        findings.append({
+            "severity": "INFO",
+            "category": "security_mode",
+            "finding": "WPA3 detected.",
+            "recommendation": "Keep firmware current and verify Protected Management Frames are configured as expected.",
+        })
+
+    aps = (passive_profile or {}).get("aps", [])
+    wanted = normalize_mac(target_bssid or target.get("bssid", ""))
+    ap = None
+    if wanted:
+        for candidate in aps:
+            if normalize_mac(candidate.get("bssid")) == wanted:
+                ap = candidate
+                break
+
+    if ap:
+        if ap.get("wps_advertised"):
+            locked_values = {str(v).lower() for v in ap.get("wps_setup_locked_values", [])}
+            if "0" in locked_values or "false" in locked_values:
+                sev = "MEDIUM"
+                finding = "WPS was advertised and the capture indicated setup was not locked."
+            else:
+                sev = "LOW"
+                finding = "WPS advertisement was observed; setup-lock state was not conclusively unsafe."
+            findings.append({
+                "severity": sev,
+                "category": "wps",
+                "finding": finding,
+                "recommendation": "Disable WPS when it is not required and prefer normal WPA2/WPA3 enrollment.",
+            })
+
+        pmf = ap.get("pmf_summary")
+        if pmf == "REQUIRED":
+            findings.append({
+                "severity": "INFO",
+                "category": "pmf",
+                "finding": "Protected Management Frames were observed as required.",
+                "recommendation": "No change required based on this observation.",
+            })
+        elif pmf == "CAPABLE_NOT_CONFIRMED_REQUIRED":
+            findings.append({
+                "severity": "LOW",
+                "category": "pmf",
+                "finding": "Protected Management Frames capability was observed but requirement was not confirmed.",
+                "recommendation": "Consider requiring PMF where client compatibility permits.",
+            })
+        elif pmf == "NOT_CONFIRMED":
+            findings.append({
+                "severity": "LOW",
+                "category": "pmf",
+                "finding": "Protected Management Frames were not confirmed by the imported evidence.",
+                "recommendation": "Verify PMF settings directly on the authorized AP.",
+            })
+
+    for group in (passive_profile or {}).get("ssid_groups", []):
+        if group.get("configuration_inconsistency"):
+            findings.append({
+                "severity": "MEDIUM",
+                "category": "configuration_consistency",
+                "finding": f"SSID {group.get('ssid')} was observed with differing security properties across BSSIDs.",
+                "recommendation": "Review AP/mesh nodes to confirm that security settings are intentionally consistent.",
+            })
+
+    if not findings:
+        findings.append({
+            "severity": "INFO",
+            "category": "insufficient_data",
+            "finding": "No defensive finding could be derived from the available metadata.",
+            "recommendation": "Collect/inspect additional authorized configuration evidence.",
+        })
+
+    severity_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2, "INFO": 3}
+    findings.sort(key=lambda x: severity_order.get(x.get("severity"), 9))
+    return findings
+
+
+def zip_directory(directory, output_path=""):
+    base = Path(directory)
+    if not base.exists() or not base.is_dir():
+        return {"ok": False, "error": "Bundle directory does not exist."}
+    out = Path(output_path) if output_path else base.with_suffix(".zip")
+    if out.exists():
+        return {"ok": False, "error": "ZIP output already exists.", "output": str(out)}
+
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for item in sorted(base.rglob("*")):
+            if item.is_file():
+                zf.write(item, item.relative_to(base))
+
+    return {
+        "ok": True,
+        "directory": str(base),
+        "output": str(out),
+        "sha256": file_sha256(out),
+        "size_bytes": out.stat().st_size,
+    }
+
+
+def verify_bundle(directory):
+    base = Path(directory)
+    manifest_path = base / "manifest.json"
+    result = {
+        "directory": str(base),
+        "manifest": str(manifest_path),
+        "ok": False,
+        "checks": {},
+        "missing": [],
+        "mismatched": [],
+    }
+    if not manifest_path.exists():
+        result["missing"].append("manifest.json")
+        return result
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    hashes = manifest.get("file_hashes", {})
+    for rel, expected in hashes.items():
+        p = base / rel
+        if not p.exists():
+            result["missing"].append(rel)
+            result["checks"][rel] = False
+            continue
+        actual = file_sha256(p)
+        ok = actual == expected
+        result["checks"][rel] = ok
+        if not ok:
+            result["mismatched"].append({
+                "file": rel,
+                "expected": expected,
+                "actual": actual,
+            })
+
+    result["ok"] = bool(hashes) and not result["missing"] and not result["mismatched"] and all(result["checks"].values())
+    return result
 
 def save_target_lock(target, output="wifi_target_lock.json"):
     p = Path(output)
@@ -1363,6 +1549,7 @@ def build_exam_bundle(capture_path="", target_lock_path="wifi_target_lock.json",
         "radio_capabilities": radio_capabilities(),
         "local_network": local,
         "neighbor_snapshot": neighbors,
+        "security_findings": build_security_findings(target=target),
     }
 
     if capture_path:
@@ -1371,6 +1558,11 @@ def build_exam_bundle(capture_path="", target_lock_path="wifi_target_lock.json",
         payload["capture_analysis"] = analyze_capture(capture_path, bssid or None)
         payload["capture_quality"] = capture_quality(capture_path, bssid)
         payload["passive_ap_profile"] = passive_ap_profiles(capture_path)
+        payload["security_findings"] = build_security_findings(
+            target=target,
+            passive_profile=payload["passive_ap_profile"],
+            target_bssid=bssid,
+        )
         if bssid:
             payload["target_station_summary"] = anonymized_station_summary(capture_path, bssid)
 
@@ -1405,6 +1597,10 @@ def build_exam_bundle(capture_path="", target_lock_path="wifi_target_lock.json",
         "files": {
             "json_report": str(report_path),
             "markdown_report": str(md_path),
+        },
+        "file_hashes": {
+            "exam_bundle.json": file_sha256(report_path),
+            "exam_bundle.md": file_sha256(md_path),
         },
         "scan_error_excerpt": scan_raw[:500] if not networks else "",
     }
@@ -1485,6 +1681,37 @@ def command_capture(args):
 
 
 
+
+
+def command_findings(args):
+    target = load_target_lock(args.target_file)
+    profile = passive_ap_profiles(args.capture) if args.capture else {}
+    data = {
+        "target": target,
+        "capture": args.capture,
+        "findings": build_security_findings(
+            target=target,
+            passive_profile=profile,
+            target_bssid=target.get("bssid", "") if target else "",
+        ),
+    }
+    print(json.dumps(data, indent=2))
+    if args.report:
+        p = save_report({"security_findings": data}, args.report)
+        print(f"\nReport saved: {p}")
+    return 0
+
+
+def command_verify_bundle(args):
+    data = verify_bundle(args.directory)
+    print(json.dumps(data, indent=2))
+    return 0 if data.get("ok") else 8
+
+
+def command_zip_bundle(args):
+    data = zip_directory(args.directory, args.output)
+    print(json.dumps(data, indent=2))
+    return 0 if data.get("ok") else 9
 
 def command_radio(args):
     data = radio_capabilities()
@@ -1721,6 +1948,21 @@ def build_parser():
     c.add_argument("--bssid", default="", help="Optional AP BSSID filter.")
     c.add_argument("--report", default="")
     c.set_defaults(func=command_capture)
+
+    fd = sub.add_parser("findings", help="Generate defensive findings from the locked target and optional passive capture.")
+    fd.add_argument("--capture", default="")
+    fd.add_argument("--target-file", default="wifi_target_lock.json")
+    fd.add_argument("--report", default="")
+    fd.set_defaults(func=command_findings)
+
+    vb = sub.add_parser("verify-bundle", help="Verify hashes in an exam evidence bundle.")
+    vb.add_argument("directory")
+    vb.set_defaults(func=command_verify_bundle)
+
+    zb = sub.add_parser("zip-bundle", help="Create a ZIP archive of an exam evidence bundle.")
+    zb.add_argument("directory")
+    zb.add_argument("--output", default="")
+    zb.set_defaults(func=command_zip_bundle)
 
     radio = sub.add_parser("radio", help="Inspect capture/monitor-mode capability without changing interface mode.")
     radio.add_argument("--report", default="")
