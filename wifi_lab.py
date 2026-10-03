@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 
-APP_VERSION = "0.4"
+APP_VERSION = "0.5"
 
 
 def run(cmd):
@@ -943,6 +943,192 @@ def anonymized_station_summary(path, target_bssid):
     result["station_tokens"] = tokens
     return result
 
+
+def compare_capture_profiles(baseline_path, current_path):
+    base = passive_ap_profiles(baseline_path)
+    cur = passive_ap_profiles(current_path)
+
+    def index(profiles):
+        return {
+            normalize_mac(ap.get("bssid")): ap
+            for ap in profiles.get("aps", [])
+            if ap.get("bssid")
+        }
+
+    a = index(base)
+    b = index(cur)
+    added = sorted(set(b) - set(a))
+    removed = sorted(set(a) - set(b))
+    common = sorted(set(a) & set(b))
+
+    fields = [
+        "ssids",
+        "channels",
+        "pmf_summary",
+        "akm_types",
+        "pairwise_cipher_types",
+        "group_cipher_types",
+        "wps_advertised",
+        "wps_setup_locked_values",
+    ]
+    changed = []
+    for mac in common:
+        diffs = {}
+        for field in fields:
+            if a[mac].get(field) != b[mac].get(field):
+                diffs[field] = {
+                    "baseline": a[mac].get(field),
+                    "current": b[mac].get(field),
+                }
+        if diffs:
+            changed.append({"bssid": b[mac].get("bssid"), "changes": diffs})
+
+    def ssid_index(profiles):
+        return {
+            g.get("ssid"): g
+            for g in profiles.get("ssid_groups", [])
+            if g.get("ssid")
+        }
+
+    sa = ssid_index(base)
+    sb = ssid_index(cur)
+    ssid_changes = []
+    for ssid in sorted(set(sa) | set(sb)):
+        left = sa.get(ssid)
+        right = sb.get(ssid)
+        if left != right:
+            ssid_changes.append({
+                "ssid": ssid,
+                "baseline": left,
+                "current": right,
+            })
+
+    return {
+        "baseline_capture": str(baseline_path),
+        "current_capture": str(current_path),
+        "baseline_sha256": file_sha256(baseline_path) if Path(baseline_path).exists() else "",
+        "current_sha256": file_sha256(current_path) if Path(current_path).exists() else "",
+        "added_bssids": [b[x].get("bssid") for x in added],
+        "removed_bssids": [a[x].get("bssid") for x in removed],
+        "changed_bssids": changed,
+        "ssid_group_changes": ssid_changes,
+        "summary": {
+            "added_count": len(added),
+            "removed_count": len(removed),
+            "changed_count": len(changed),
+            "ssid_group_change_count": len(ssid_changes),
+        },
+        "note": (
+            "Changes are observational. A changed BSSID/security signature can have benign causes "
+            "such as AP replacement, mesh behavior, roaming, firmware updates or configuration changes."
+        ),
+    }
+
+
+def _md_escape(value):
+    return str(value).replace("|", "\\|").replace("\n", " ")
+
+
+def render_markdown_report(report):
+    lines = [
+        "# WiFi Security Lab Report",
+        "",
+        f"- App version: {report.get('version', APP_VERSION)}",
+        f"- Created: {report.get('created_at', '')}",
+        f"- Scope: {report.get('scope', '')}",
+        "",
+    ]
+    payload = report.get("payload", {}) if isinstance(report, dict) else {}
+
+    target = payload.get("target")
+    if target:
+        lines += [
+            "## Target",
+            "",
+            "| Field | Value |",
+            "|---|---|",
+            f"| SSID | {_md_escape(target.get('ssid') or '<hidden>')} |",
+            f"| BSSID | {_md_escape(target.get('bssid') or '')} |",
+            f"| Security | {_md_escape(target.get('security_detail', {}).get('mode', target.get('security', '')))} |",
+            f"| Channel | {_md_escape(target.get('channel') or '')} |",
+            f"| Signal | {_md_escape(target.get('signal') or '')} |",
+            "",
+        ]
+
+    readiness = payload.get("readiness") or payload.get("diagnostics")
+    if readiness:
+        lines += [
+            "## Readiness / Diagnostics",
+            "",
+            f"- Status: **{_md_escape(readiness.get('status', 'captured'))}**",
+            "",
+        ]
+        for key, value in (readiness.get("checks") or {}).items():
+            state = "PASS" if value else "CHECK"
+            lines.append(f"- {key}: {state}")
+
+    quality = payload.get("capture_quality")
+    if quality:
+        lines += [
+            "",
+            "## Capture Quality",
+            "",
+            f"- Status: **{_md_escape(quality.get('status'))}**",
+            f"- Handshake evidence: {_md_escape(quality.get('handshake_evidence'))}",
+            "",
+        ]
+        missing = quality.get("missing_core_evidence") or []
+        if missing:
+            lines.append("Missing core evidence:")
+            for item in missing:
+                lines.append(f"- {_md_escape(item)}")
+        else:
+            lines.append("No core-evidence gaps were reported by the analyzer.")
+
+    analysis = payload.get("capture_analysis")
+    if analysis:
+        lines += [
+            "",
+            "## EAPOL Evidence",
+            "",
+            f"- Matching EAPOL frames: {analysis.get('eapol_frame_count', 0)}",
+            f"- Evidence state: {_md_escape(analysis.get('handshake_evidence'))}",
+            "",
+            "| Message | Count |",
+            "|---|---:|",
+        ]
+        for key in ["M1", "M2", "M3", "M4", "UNKNOWN"]:
+            lines.append(f"| {key} | {analysis.get('message_counts', {}).get(key, 0)} |")
+
+    stats = payload.get("capture_statistics")
+    if stats:
+        lines += [
+            "",
+            "## Capture Integrity",
+            "",
+            f"- SHA-256: {stats.get('sha256', '')}",
+            f"- Size: {stats.get('size_bytes', 0)} bytes",
+            f"- Frames: {stats.get('frame_count', 0)}",
+            f"- Duration: {stats.get('duration_seconds')} seconds",
+        ]
+
+    lines += [
+        "",
+        "## Scope Note",
+        "",
+        "This report documents passive/authorized lab observations. It does not claim ownership, intent, or maliciousness for observed devices.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def export_markdown_from_json(json_path, output_path=""):
+    p = Path(json_path)
+    data = json.loads(p.read_text(encoding="utf-8"))
+    out = Path(output_path) if output_path else p.with_suffix(".md")
+    out.write_text(render_markdown_report(data), encoding="utf-8")
+    return out
+
 def save_report(payload, output="wifi_lab_report.json"):
     p = Path(output)
     envelope = {
@@ -1004,6 +1190,21 @@ def command_capture(args):
 
 
 
+
+
+def command_compare(args):
+    data = compare_capture_profiles(args.baseline, args.current)
+    print(json.dumps(data, indent=2))
+    if args.report:
+        p = save_report({"capture_comparison": data}, args.report)
+        print(f"\nReport saved: {p}")
+    return 0
+
+
+def command_markdown(args):
+    out = export_markdown_from_json(args.report_json, args.output)
+    print(f"Markdown report saved: {out}")
+    return 0
 
 def command_readiness(args):
     data = readiness_check()
@@ -1126,6 +1327,17 @@ def build_parser():
     c.add_argument("--bssid", default="", help="Optional AP BSSID filter.")
     c.add_argument("--report", default="")
     c.set_defaults(func=command_capture)
+
+    cp = sub.add_parser("compare", help="Compare two passive capture profiles for configuration drift.")
+    cp.add_argument("baseline")
+    cp.add_argument("current")
+    cp.add_argument("--report", default="")
+    cp.set_defaults(func=command_compare)
+
+    md = sub.add_parser("markdown", help="Render a saved JSON lab report as Markdown.")
+    md.add_argument("report_json")
+    md.add_argument("--output", default="")
+    md.set_defaults(func=command_markdown)
 
     rd = sub.add_parser("readiness", help="Check whether the machine is ready for scan/imported-capture analysis.")
     rd.add_argument("--report", default="")
