@@ -6,7 +6,11 @@ on:
       - wifi-security-lab-v1
     paths:
       - "wifi_lab.py"
+      - "wifi_lab_bundle.py"
+      - "wifi_lab_batch.py"
+      - "RUN_WIFI_LAB.bat"
       - "README_WIFI_LAB.md"
+      - "docs/WIFI_LAB_FUNCTIONS.md"
       - ".github/workflows/wifi-lab-build.yml"
   workflow_dispatch:
 
@@ -19,9 +23,15 @@ jobs:
         with:
           python-version: "3.12"
       - name: Compile check
-        run: python -m py_compile wifi_lab.py
-      - name: CLI help smoke test
-        run: python wifi_lab.py --help
+        run: |
+          python -m py_compile wifi_lab.py
+          python -m py_compile wifi_lab_bundle.py
+          python -m py_compile wifi_lab_batch.py
+      - name: CLI help smoke tests
+        run: |
+          python wifi_lab.py --help
+          python wifi_lab_bundle.py --help
+          python wifi_lab_batch.py --help
       - name: Offline self-test
         run: python wifi_lab.py selftest
 
