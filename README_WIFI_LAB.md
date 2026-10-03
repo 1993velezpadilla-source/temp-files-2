@@ -1,4 +1,4 @@
-# WiFi Security Lab v0.2
+# WiFi Security Lab v0.3
 
 Functions-first CLI for an authorized classroom/home Wi-Fi security assessment.
 
@@ -15,6 +15,16 @@ Functions-first CLI for an authorized classroom/home Wi-Fi security assessment.
 - Conservative 4-way key-message classification (M1/M2/M3/M4) when the installed TShark build exposes a recognized RSN key-info field.
 - BSSID filtering so imported evidence can be restricted to the selected authorized AP.
 - JSON evidence reports with timestamps.
+- SHA-256 integrity fingerprint for imported captures.
+- Capture frame count, time span and management-frame event counts.
+- Passive AP profiling from beacon/probe-response evidence.
+- PMF/MFP capable/required observations when exposed by TShark.
+- WPS advertisement/setup-lock observations.
+- RSN AKM, pairwise cipher and group cipher observations.
+- Hidden-SSID observations.
+- SSID-to-BSSID grouping and configuration-inconsistency warnings.
+- Local interface/gateway snapshot.
+- Anonymized station counts/tokens for a selected authorized AP (no raw client MACs in the report).
 
 ## Intentionally not implemented
 
@@ -76,6 +86,30 @@ Diagnostics:
 python wifi_lab.py diag
 \`\`\`
 
+Local interface/gateway diagnostics:
+
+```
+python wifi_lab.py netinfo
+```
+
+Capture statistics and integrity fingerprint:
+
+```
+python wifi_lab.py stats exam.pcapng
+```
+
+Build passive AP security profiles:
+
+```
+python wifi_lab.py profile exam.pcapng
+```
+
+For a selected authorized AP, include anonymized station counts:
+
+```
+python wifi_lab.py profile exam.pcapng --bssid AA:BB:CC:DD:EE:FF
+```
+
 Analyze an authorized capture:
 
 \`\`\`
@@ -108,3 +142,13 @@ Scanning for nearby networks and capturing raw 802.11 traffic are different capa
 ## Development priority
 
 Core functions first. GUI polish comes only after the scanner, diagnostics, evidence parser and reporting path are stable.
+
+
+## Passive-only event observation
+
+The capture statistics command may report how many association, authentication, disassociation and deauthentication frames were **already present in the imported capture**. It does not transmit any of those frames.
+
+## Wireshark compatibility
+
+The program asks the installed TShark build for its field registry and only uses fields actually supported on that machine. This is important because Wireshark renamed several 802.11 management/RSN fields across major versions.
+
