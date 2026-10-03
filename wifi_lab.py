@@ -1381,6 +1381,132 @@ def render_markdown_report(report):
     return "\n".join(lines)
 
 
+
+def _html_escape(value):
+    return (
+        str(value)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#39;")
+    )
+
+
+def render_html_report(report):
+    payload = report.get("payload", {}) if isinstance(report, dict) else {}
+    target = payload.get("target") or {}
+    verdict = payload.get("exam_verdict") or {}
+    quality = payload.get("capture_quality") or {}
+    analysis = payload.get("capture_analysis") or {}
+    findings = payload.get("security_findings") or []
+    stats = payload.get("capture_statistics") or {}
+    readiness = payload.get("readiness") or {}
+
+    def row(label, value):
+        return (
+            "<tr><th>" + _html_escape(label) + "</th><td>" +
+            _html_escape(value if value not in (None, "") else "—") +
+            "</td></tr>"
+        )
+
+    finding_rows = []
+    for item in findings:
+        finding_rows.append(
+            "<tr>"
+            "<td>" + _html_escape(item.get("severity", "")) + "</td>"
+            "<td>" + _html_escape(item.get("category", "")) + "</td>"
+            "<td>" + _html_escape(item.get("finding", "")) + "</td>"
+            "<td>" + _html_escape(item.get("recommendation", "")) + "</td>"
+            "</tr>"
+        )
+    if not finding_rows:
+        finding_rows.append("<tr><td colspan='4'>No findings recorded.</td></tr>")
+
+    counts = analysis.get("message_counts") or {}
+    eapol_rows = "".join(
+        "<tr><th>" + key + "</th><td>" + _html_escape(counts.get(key, 0)) + "</td></tr>"
+        for key in ["M1", "M2", "M3", "M4", "UNKNOWN"]
+    )
+
+    target_rows = "".join([
+        row("SSID", target.get("ssid") or "<hidden>"),
+        row("BSSID", target.get("bssid")),
+        row("Security", (target.get("security_detail") or {}).get("mode") or target.get("security")),
+        row("Channel", target.get("channel")),
+        row("Signal", target.get("signal")),
+    ])
+
+    capture_rows = "".join([
+        row("Verdict", verdict.get("status")),
+        row("Capture quality", quality.get("status")),
+        row("Handshake evidence", analysis.get("handshake_evidence")),
+        row("EAPOL frames", analysis.get("eapol_frame_count", 0)),
+        row("Capture SHA-256", stats.get("sha256")),
+        row("Frames", stats.get("frame_count")),
+        row("Duration (seconds)", stats.get("duration_seconds")),
+    ])
+
+    readiness_rows = "".join([
+        row("Readiness", readiness.get("status")),
+        row("Visible networks", readiness.get("network_count_visible")),
+        row("Local gateway", readiness.get("local_gateway")),
+    ])
+
+    created = report.get("created_at", "")
+    version = report.get("version", APP_VERSION)
+    scope = report.get("scope", "")
+
+    return """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WiFi Security Lab Report</title>
+<style>
+body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:#f4f5f7;color:#17191c}
+main{max-width:980px;margin:24px auto;padding:0 16px 48px}
+header{background:#111820;color:#fff;padding:24px;border-radius:14px}
+section{background:#fff;margin-top:16px;padding:20px;border-radius:12px;border:1px solid #ddd}
+h1,h2{margin-top:0}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;vertical-align:top;padding:9px;border-bottom:1px solid #e5e5e5}
+th{width:220px}
+.small{opacity:.75;font-size:.92rem}
+code{word-break:break-all}
+.badge{display:inline-block;padding:4px 9px;border-radius:999px;background:#eceff3;font-weight:700}
+</style>
+</head>
+<body><main>
+<header>
+<h1>WiFi Security Lab Report</h1>
+<div>Version """ + _html_escape(version) + """</div>
+<div class="small">""" + _html_escape(created) + """</div>
+<div class="small">""" + _html_escape(scope) + """</div>
+</header>
+<section><h2>Authorized Target</h2><table>""" + target_rows + """</table></section>
+<section><h2>Environment Readiness</h2><table>""" + readiness_rows + """</table></section>
+<section><h2>Evidence Result</h2><table>""" + capture_rows + """</table></section>
+<section><h2>EAPOL Key Messages Observed</h2><table>""" + eapol_rows + """</table></section>
+<section><h2>Security Findings</h2>
+<table>
+<tr><th>Severity</th><th>Category</th><th>Finding</th><th>Recommendation</th></tr>
+""" + "".join(finding_rows) + """
+</table></section>
+<section><h2>Scope</h2>
+<p>This report documents passive and authorized classroom/home-lab observations.
+It does not perform password cracking, forced deauthentication, or credential extraction.</p>
+</section>
+</main></body></html>"""
+
+
+def export_html_from_json(json_path, output_path=""):
+    p = Path(json_path)
+    data = json.loads(p.read_text(encoding="utf-8"))
+    out = Path(output_path) if output_path else p.with_suffix(".html")
+    out.write_text(render_html_report(data), encoding="utf-8")
+    return out
+
 def export_markdown_from_json(json_path, output_path=""):
     p = Path(json_path)
     data = json.loads(p.read_text(encoding="utf-8"))
@@ -1939,6 +2065,9 @@ def build_exam_bundle(capture_path="", target_lock_path="wifi_target_lock.json",
     md_path = out / "exam_bundle.md"
     md_path.write_text(render_markdown_report(envelope), encoding="utf-8")
 
+    html_path = out / "exam_bundle.html"
+    html_path.write_text(render_html_report(envelope), encoding="utf-8")
+
     manifest = {
         "created_at": envelope["created_at"],
         "app_version": APP_VERSION,
@@ -1952,10 +2081,12 @@ def build_exam_bundle(capture_path="", target_lock_path="wifi_target_lock.json",
         "files": {
             "json_report": str(report_path),
             "markdown_report": str(md_path),
+            "html_report": str(html_path),
         },
         "file_hashes": {
             "exam_bundle.json": file_sha256(report_path),
             "exam_bundle.md": file_sha256(md_path),
+            "exam_bundle.html": file_sha256(html_path),
         },
         "scan_error_excerpt": scan_raw[:500] if not networks else "",
     }
@@ -1966,6 +2097,7 @@ def build_exam_bundle(capture_path="", target_lock_path="wifi_target_lock.json",
         "output_dir": str(out),
         "json_report": str(report_path),
         "markdown_report": str(md_path),
+        "html_report": str(html_path),
         "manifest": str(manifest_path),
         "target": target,
         "capture_included": bool(capture_path),
@@ -2993,6 +3125,12 @@ def command_compare(args):
     return 0
 
 
+
+def command_html(args):
+    out = export_html_from_json(args.report_json, args.output)
+    print(f"HTML report saved: {out}")
+    return 0
+
 def command_markdown(args):
     out = export_markdown_from_json(args.report_json, args.output)
     print(f"Markdown report saved: {out}")
@@ -3257,6 +3395,11 @@ def build_parser():
     cp.add_argument("current")
     cp.add_argument("--report", default="")
     cp.set_defaults(func=command_compare)
+
+    ht = sub.add_parser("html", help="Render a saved JSON lab report as a standalone HTML report.")
+    ht.add_argument("report_json")
+    ht.add_argument("--output", default="")
+    ht.set_defaults(func=command_html)
 
     md = sub.add_parser("markdown", help="Render a saved JSON lab report as Markdown.")
     md.add_argument("report_json")
