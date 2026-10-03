@@ -1,4 +1,5 @@
 import argparse
+import csv
 import datetime
 import json
 import hashlib
@@ -12,7 +13,7 @@ import zipfile
 from pathlib import Path
 
 
-APP_VERSION = "1.0"
+APP_VERSION = "1.1"
 
 
 def run(cmd):
@@ -2161,6 +2162,188 @@ def watch_target(ssid="", bssid="", interval_seconds=2.0, samples=30):
     )
     return result
 
+
+def _signal_score(value):
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return -10000.0
+    m = re.search(r"-?\d+(?:\.\d+)?", raw)
+    if not m:
+        return -10000.0
+    number = float(m.group(0))
+    if "%" in raw:
+        return number
+    if "dbm" in raw or number < 0:
+        return number + 100.0
+    return number
+
+
+def find_visible_targets(query, exact=False):
+    networks, raw = scan_networks()
+    q = str(query or "").strip()
+    if not q:
+        return {
+            "query": q,
+            "exact": bool(exact),
+            "matches": [],
+            "error": "A non-empty SSID query is required.",
+        }
+
+    qfold = q.casefold()
+    matches = []
+    for net in networks:
+        ssid = str(net.get("ssid") or "")
+        folded = ssid.casefold()
+        ok = folded == qfold if exact else qfold in folded
+        if ok:
+            item = dict(net)
+            item["signal_score"] = _signal_score(item.get("signal"))
+            matches.append(item)
+
+    matches.sort(
+        key=lambda n: (-n.get("signal_score", -10000.0), n.get("ssid", ""), n.get("bssid", ""))
+    )
+    result = {
+        "query": q,
+        "exact": bool(exact),
+        "visible_network_count": len(networks),
+        "match_count": len(matches),
+        "matches": matches,
+        "scan_error_excerpt": raw[:500] if not networks else "",
+    }
+    if matches:
+        result["strongest_signal_candidate"] = matches[0]
+        result["note"] = (
+            "Strongest signal is only a convenience hint. In multi-AP/mesh environments, "
+            "choose the BSSID the instructor identifies rather than assuming strongest means correct."
+        )
+    return result
+
+
+def reconcile_target_with_capture(target, capture_path):
+    target = target or {}
+    profile = passive_ap_profiles(capture_path)
+    wanted_bssid = normalize_mac(target.get("bssid"))
+    wanted_ssid = str(target.get("ssid") or "")
+    wanted_channel = str(target.get("channel") or "").strip()
+
+    matched = None
+    for ap in profile.get("aps", []):
+        if wanted_bssid and normalize_mac(ap.get("bssid")) == wanted_bssid:
+            matched = ap
+            break
+
+    checks = {
+        "capture_exists": Path(capture_path).exists(),
+        "target_bssid_present": bool(matched) if wanted_bssid else None,
+        "target_ssid_matches": None,
+        "target_channel_matches": None,
+    }
+
+    if matched is not None:
+        ssids = {str(x) for x in matched.get("ssids", [])}
+        if wanted_ssid:
+            checks["target_ssid_matches"] = wanted_ssid in ssids
+
+        channels = {str(x) for x in matched.get("channels", [])}
+        if wanted_channel and channels:
+            checks["target_channel_matches"] = wanted_channel in channels
+
+    if not checks["capture_exists"]:
+        status = "NO_CAPTURE"
+    elif wanted_bssid and not checks["target_bssid_present"]:
+        status = "TARGET_MISMATCH"
+    elif checks["target_ssid_matches"] is False:
+        status = "TARGET_METADATA_MISMATCH"
+    elif checks["target_channel_matches"] is False:
+        status = "TARGET_CHANNEL_CHANGED_OR_MISMATCHED"
+    elif matched:
+        status = "TARGET_CONFIRMED_IN_CAPTURE"
+    else:
+        status = "INSUFFICIENT_TARGET_METADATA"
+
+    return {
+        "status": status,
+        "target": target,
+        "matched_capture_profile": matched,
+        "checks": checks,
+        "capture": str(capture_path),
+        "warnings": profile.get("warnings", []),
+        "note": (
+            "A channel mismatch can be benign if the AP changed channels between the operating-system scan "
+            "and the capture. BSSID/SSID agreement is stronger evidence of target identity."
+        ),
+    }
+
+
+def exam_verdict(target=None, capture_path=""):
+    target = target or {}
+    result = {
+        "status": "NO_EVIDENCE",
+        "target": target,
+        "capture": capture_path,
+        "reasons": [],
+        "reconciliation": None,
+        "capture_quality": None,
+    }
+
+    if not target:
+        result["status"] = "NO_TARGET"
+        result["reasons"].append("No authorized AP target is locked.")
+        return result
+
+    if not capture_path:
+        result["status"] = "TARGET_ONLY"
+        result["reasons"].append("Target is locked but no capture was supplied.")
+        return result
+
+    rec = reconcile_target_with_capture(target, capture_path)
+    quality = capture_quality(capture_path, target.get("bssid", ""))
+    result["reconciliation"] = rec
+    result["capture_quality"] = quality
+
+    if rec.get("status") in {"TARGET_MISMATCH", "TARGET_METADATA_MISMATCH"}:
+        result["status"] = "MISMATCH"
+        result["reasons"].append("The imported capture does not match the locked target strongly enough.")
+        return result
+
+    qstatus = quality.get("status")
+    if rec.get("status") == "TARGET_CONFIRMED_IN_CAPTURE" and qstatus == "STRONG_EVIDENCE_SET":
+        result["status"] = "PASS"
+        result["reasons"].append("Locked target is confirmed in the capture and a complete four-way EAPOL sequence was observed.")
+    elif rec.get("status") in {"TARGET_CONFIRMED_IN_CAPTURE", "TARGET_CHANNEL_CHANGED_OR_MISMATCHED"} and qstatus == "USABLE_PARTIAL_EVIDENCE":
+        result["status"] = "PARTIAL"
+        result["reasons"].append("Target evidence is usable but the capture is incomplete.")
+    elif qstatus == "CAPTURE_PRESENT_BUT_MISSING_CORE_EVIDENCE":
+        result["status"] = "NO_CORE_EVIDENCE"
+        result["reasons"].append("Capture exists but required target/EAPOL evidence is missing.")
+    else:
+        result["status"] = "INCONCLUSIVE"
+        result["reasons"].append("Available observations are insufficient for a strong exam evidence verdict.")
+
+    return result
+
+
+def export_scan_csv(output_path="wifi_scan.csv", query=""):
+    networks, _ = scan_networks()
+    if query:
+        q = query.casefold()
+        networks = [n for n in networks if q in str(n.get("ssid") or "").casefold()]
+
+    out = Path(output_path)
+    fields = ["ssid", "bssid", "security", "signal", "channel", "radio", "source"]
+    with out.open("w", encoding="utf-8", newline="") as fp:
+        writer = csv.DictWriter(fp, fieldnames=fields)
+        writer.writeheader()
+        for net in networks:
+            writer.writerow({k: net.get(k, "") for k in fields})
+
+    return {
+        "output": str(out),
+        "row_count": len(networks),
+        "sha256": file_sha256(out),
+    }
+
 def save_report(payload, output="wifi_lab_report.json"):
     p = Path(output)
     envelope = {
@@ -2425,6 +2608,45 @@ def command_watch(args):
         print(f"\nReport saved: {p}")
     return 0 if data.get("status") in {"SEEN", "AMBIGUOUS"} else 9
 
+
+def command_find(args):
+    data = find_visible_targets(args.query, exact=args.exact)
+    print(json.dumps(data, indent=2))
+    if args.report:
+        p = save_report({"target_search": data}, args.report)
+        print(f"\nReport saved: {p}")
+    return 0 if data.get("match_count", 0) else 8
+
+
+def command_reconcile(args):
+    target = load_target_lock(args.target_file)
+    if not target:
+        data = {"status": "NO_TARGET", "error": f"Could not load target lock: {args.target_file}"}
+        print(json.dumps(data, indent=2))
+        return 2
+    data = reconcile_target_with_capture(target, args.capture)
+    print(json.dumps(data, indent=2))
+    if args.report:
+        p = save_report({"target_capture_reconciliation": data}, args.report)
+        print(f"\nReport saved: {p}")
+    return 0 if data.get("status") in {"TARGET_CONFIRMED_IN_CAPTURE", "TARGET_CHANNEL_CHANGED_OR_MISMATCHED"} else 10
+
+
+def command_verdict(args):
+    target = load_target_lock(args.target_file)
+    data = exam_verdict(target, args.capture)
+    print(json.dumps(data, indent=2))
+    if args.report:
+        p = save_report({"exam_verdict": data}, args.report)
+        print(f"\nReport saved: {p}")
+    return 0 if data.get("status") in {"PASS", "PARTIAL"} else 11
+
+
+def command_scan_csv(args):
+    data = export_scan_csv(args.output, args.query)
+    print(json.dumps(data, indent=2))
+    return 0
+
 def command_compare(args):
     data = compare_capture_profiles(args.baseline, args.current)
     print(json.dumps(data, indent=2))
@@ -2645,6 +2867,29 @@ def build_parser():
     wt.add_argument("--samples", type=int, default=30, help="Number of scans; maximum 300.")
     wt.add_argument("--report", default="")
     wt.set_defaults(func=command_watch)
+
+    fnd = sub.add_parser("find", help="Find visible SSIDs by exact or partial name and sort by signal.")
+    fnd.add_argument("query")
+    fnd.add_argument("--exact", action="store_true")
+    fnd.add_argument("--report", default="")
+    fnd.set_defaults(func=command_find)
+
+    rc = sub.add_parser("reconcile", help="Confirm that an imported capture belongs to the locked authorized AP.")
+    rc.add_argument("capture")
+    rc.add_argument("--target-file", default="wifi_target_lock.json")
+    rc.add_argument("--report", default="")
+    rc.set_defaults(func=command_reconcile)
+
+    vd = sub.add_parser("verdict", help="Produce PASS/PARTIAL/MISMATCH/NO-EVIDENCE status for the locked AP and capture.")
+    vd.add_argument("capture")
+    vd.add_argument("--target-file", default="wifi_target_lock.json")
+    vd.add_argument("--report", default="")
+    vd.set_defaults(func=command_verdict)
+
+    scsv = sub.add_parser("scan-csv", help="Export the current Wi-Fi scan as CSV.")
+    scsv.add_argument("--output", default="wifi_scan.csv")
+    scsv.add_argument("--query", default="", help="Optional case-insensitive SSID substring.")
+    scsv.set_defaults(func=command_scan_csv)
 
     cp = sub.add_parser("compare", help="Compare two passive capture profiles for configuration drift.")
     cp.add_argument("baseline")
