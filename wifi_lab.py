@@ -13,7 +13,7 @@ import zipfile
 from pathlib import Path
 
 
-APP_VERSION = "1.6"
+APP_VERSION = "1.7"
 
 
 def run(cmd):
@@ -2253,6 +2253,7 @@ def build_exam_bundle(capture_path="", target_lock_path="wifi_target_lock.json",
         payload["capinfos"] = capinfos_summary(capture_path)
         payload["pyshark_summary"] = pyshark_capture_summary(capture_path, bssid)
         payload["capture_analysis"] = analyze_capture(capture_path, bssid or None)
+        payload["deauth_observation"] = deauth_observation_analysis(capture_path, bssid, 15.0)
         payload["capture_quality"] = capture_quality(capture_path, bssid)
         payload["passive_ap_profile"] = passive_ap_profiles(capture_path)
         payload["timeline"] = capture_timeline(capture_path, bssid, max_events=500)
@@ -3177,6 +3178,115 @@ def chain_of_custody(paths, output="chain_of_custody.json", target_lock_path="wi
         "record": record,
     }
 
+
+def deauth_observation_analysis(path, target_bssid="", correlation_window=15.0):
+    p = Path(path)
+    result = {
+        "capture": str(p),
+        "target_bssid": target_bssid,
+        "correlation_window_seconds": float(correlation_window),
+        "deauthentication_observed": 0,
+        "disassociation_observed": 0,
+        "authentication_observed": 0,
+        "association_requests": 0,
+        "eapol_frames": 0,
+        "correlated_reconnect_sequences": [],
+        "status": "NOT_ANALYZED",
+        "warnings": [],
+        "note": (
+            "Passive observation only. This function never transmits deauthentication "
+            "or disassociation frames."
+        ),
+    }
+
+    if not p.exists():
+        result["warnings"].append("Capture file does not exist.")
+        result["status"] = "NO_CAPTURE"
+        return result
+    if not tool_exists("tshark"):
+        result["warnings"].append("tshark is not installed or not on PATH.")
+        result["status"] = "TSHARK_MISSING"
+        return result
+
+    bssid_filter = f" && wlan.bssid == {target_bssid}" if target_bssid else ""
+
+    filters = {
+        "deauthentication_observed": f"wlan.fc.type == 0 && wlan.fc.subtype == 12{bssid_filter}",
+        "disassociation_observed": f"wlan.fc.type == 0 && wlan.fc.subtype == 10{bssid_filter}",
+        "authentication_observed": f"wlan.fc.type == 0 && wlan.fc.subtype == 11{bssid_filter}",
+        "association_requests": f"wlan.fc.type == 0 && wlan.fc.subtype == 0{bssid_filter}",
+        "eapol_frames": f"eapol{bssid_filter}",
+    }
+    for key, filt in filters.items():
+        count = _count_tshark_filter(p, filt)
+        result[key] = count if count is not None else 0
+
+    timeline = target_event_timeline(
+        p,
+        target_bssid,
+        window_seconds=correlation_window,
+        max_events=5000,
+    ) if target_bssid else capture_timeline(p, "", max_events=5000)
+
+    events = timeline.get("events", [])
+    deauths = [
+        e for e in events
+        if e.get("event") in {"deauthentication_observed", "disassociation_observed"}
+    ]
+
+    reconnects = []
+    for d in deauths:
+        seq = {
+            "disconnect_frame": d.get("frame"),
+            "disconnect_event": d.get("event"),
+            "disconnect_relative_seconds": d.get("relative_seconds"),
+            "station_tokens": d.get("station_tokens", []),
+            "auth_frame": None,
+            "assoc_frame": None,
+            "first_eapol_frame": None,
+            "delta_to_eapol_seconds": None,
+        }
+        d_epoch = float(d.get("epoch") or 0.0)
+        for e in events:
+            e_epoch = float(e.get("epoch") or 0.0)
+            if e_epoch < d_epoch:
+                continue
+            delta = e_epoch - d_epoch
+            if delta > float(correlation_window):
+                break
+
+            shared = True
+            dtok = set(d.get("station_tokens", []))
+            etok = set(e.get("station_tokens", []))
+            if dtok and etok:
+                shared = bool(dtok & etok)
+
+            if not shared:
+                continue
+
+            if seq["auth_frame"] is None and e.get("event") == "authentication":
+                seq["auth_frame"] = e.get("frame")
+            elif seq["assoc_frame"] is None and e.get("event") == "association_request":
+                seq["assoc_frame"] = e.get("frame")
+            elif seq["first_eapol_frame"] is None and str(e.get("event", "")).startswith("eapol_"):
+                seq["first_eapol_frame"] = e.get("frame")
+                seq["delta_to_eapol_seconds"] = round(delta, 6)
+                break
+
+        if seq["first_eapol_frame"] is not None:
+            reconnects.append(seq)
+
+    result["correlated_reconnect_sequences"] = reconnects
+
+    if reconnects:
+        result["status"] = "DISCONNECT_TO_REAUTH_SEQUENCE_OBSERVED"
+    elif result["deauthentication_observed"] or result["disassociation_observed"]:
+        result["status"] = "DISCONNECT_FRAMES_OBSERVED_NO_EAPOL_CORRELATION"
+    else:
+        result["status"] = "NO_DISCONNECT_FRAMES_OBSERVED"
+
+    return result
+
 def save_report(payload, output="wifi_lab_report.json"):
     p = Path(output)
     envelope = {
@@ -3591,6 +3701,19 @@ def command_custody(args):
     }, indent=2))
     return 0
 
+
+def command_deauth_observe(args):
+    data = deauth_observation_analysis(
+        args.capture,
+        target_bssid=args.bssid,
+        correlation_window=args.window,
+    )
+    print(json.dumps(data, indent=2))
+    if args.report:
+        p = save_report({"deauth_observation": data}, args.report)
+        print(f"\nReport saved: {p}")
+    return 0 if data.get("status") != "NOT_ANALYZED" else 22
+
 def command_compare(args):
     data = compare_capture_profiles(args.baseline, args.current)
     print(json.dumps(data, indent=2))
@@ -3909,6 +4032,13 @@ def build_parser():
     cu.add_argument("--output", default="chain_of_custody.json")
     cu.add_argument("--target-file", default="wifi_target_lock.json")
     cu.set_defaults(func=command_custody)
+
+    dao = sub.add_parser("deauth-observe", help="Passively detect disconnect frames and correlate them with later reauthentication/EAPOL.")
+    dao.add_argument("capture")
+    dao.add_argument("--bssid", default="", help="Optional authorized AP BSSID.")
+    dao.add_argument("--window", type=float, default=15.0, help="Correlation window in seconds.")
+    dao.add_argument("--report", default="")
+    dao.set_defaults(func=command_deauth_observe)
 
     cp = sub.add_parser("compare", help="Compare two passive capture profiles for configuration drift.")
     cp.add_argument("baseline")
