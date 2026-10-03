@@ -1,4 +1,4 @@
-# WiFi Security Lab v1.2
+# WiFi Security Lab v1.3
 
 Functions-first CLI for an authorized classroom/home Wi-Fi security assessment.
 
@@ -255,3 +255,25 @@ python wifi_lab.py validate-lock
 \`\`\`
 
 A channel change does not automatically mean the target is wrong; APs can change channels. A BSSID/SSID mismatch is treated more seriously.
+
+
+## Capture doctor
+
+Validate a PCAP/PCAPNG before relying on it:
+
+\`\`\`
+python wifi_lab.py doctor exam.pcapng --report doctor.json
+\`\`\`
+
+It checks readability, frame presence, 802.11 frames, radiotap metadata, EAPOL presence, malformed-frame observations, encapsulation types, SHA-256 and basic capture metadata.
+
+## Passive AP index
+
+List APs already present in an imported capture:
+
+\`\`\`
+python wifi_lab.py pcap-index exam.pcapng
+python wifi_lab.py pcap-index exam.pcapng --ssid "Instructor"
+\`\`\`
+
+This is passive indexing only; it does not probe or transmit to the networks.
