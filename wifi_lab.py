@@ -13,7 +13,7 @@ import zipfile
 from pathlib import Path
 
 
-APP_VERSION = "1.7"
+APP_VERSION = "1.8"
 
 
 def run(cmd):
@@ -3339,6 +3339,66 @@ def deauth_observation_analysis(path, target_bssid="", correlation_window=15.0):
 
     return result
 
+
+def load_verified_exam_result(path, target=None):
+    p = Path(path)
+    target = target or {}
+    result = {
+        "source": str(p),
+        "status": "NO_RESULT",
+        "target_ssid": "",
+        "target_bssid": "",
+        "result_value": "",
+        "result_sha256": "",
+        "source_sha256": "",
+        "warnings": [],
+    }
+
+    if not p.exists():
+        result["warnings"].append("Result file does not exist.")
+        return result
+
+    result["source_sha256"] = file_sha256(p)
+
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:
+        result["status"] = "INVALID_RESULT"
+        result["warnings"].append("Result file is not valid JSON: " + str(e))
+        return result
+
+    ssid = str(data.get("target_ssid", ""))
+    bssid = str(data.get("target_bssid", ""))
+    value = str(data.get("result_value", ""))
+
+    result["target_ssid"] = ssid
+    result["target_bssid"] = bssid
+
+    if not value:
+        result["status"] = "EMPTY_RESULT"
+        result["warnings"].append("Result value is empty.")
+        return result
+
+    expected_bssid = normalize_mac(target.get("bssid", ""))
+    supplied_bssid = normalize_mac(bssid)
+    expected_ssid = str(target.get("ssid", "") or "")
+
+    if expected_bssid and supplied_bssid != expected_bssid:
+        result["status"] = "TARGET_MISMATCH"
+        result["warnings"].append("Result BSSID does not match the locked target.")
+        return result
+
+    if expected_ssid and ssid and ssid != expected_ssid:
+        result["status"] = "TARGET_MISMATCH"
+        result["warnings"].append("Result SSID does not match the locked target.")
+        return result
+
+    result["result_value"] = value
+    result["result_sha256"] = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    result["status"] = "RESULT_VERIFIED"
+    return result
+
+
 def save_report(payload, output="wifi_lab_report.json"):
     p = Path(output)
     envelope = {
@@ -3780,6 +3840,20 @@ def command_passive_live(args):
         print(f"\nReport saved: {p}")
     return 0 if data.get("ok") else 20
 
+
+def command_final_result(args):
+    target = load_target_lock(args.target_file)
+    data = load_verified_exam_result(args.result_file, target=target)
+    print(json.dumps(data, indent=2))
+    if args.report:
+        p = save_report({
+            "target": target,
+            "final_result": data,
+        }, args.report)
+        print(f"\nReport saved: {p}")
+    return 0 if data.get("status") == "RESULT_VERIFIED" else 21
+
+
 def command_compare(args):
     data = compare_capture_profiles(args.baseline, args.current)
     print(json.dumps(data, indent=2))
@@ -4113,6 +4187,12 @@ def build_parser():
     plc.add_argument("--bssid", default="", help="Optional authorized AP BSSID for post-capture EAPOL filtering.")
     plc.add_argument("--report", default="")
     plc.set_defaults(func=command_passive_live)
+
+    fr = sub.add_parser("final-result", help="Validate and display an authorized exam result against the locked target.")
+    fr.add_argument("result_file")
+    fr.add_argument("--target-file", default="wifi_target_lock.json")
+    fr.add_argument("--report", default="")
+    fr.set_defaults(func=command_final_result)
 
     cp = sub.add_parser("compare", help="Compare two passive capture profiles for configuration drift.")
     cp.add_argument("baseline")
