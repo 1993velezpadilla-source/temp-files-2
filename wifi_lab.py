@@ -13,7 +13,7 @@ import zipfile
 from pathlib import Path
 
 
-APP_VERSION = "1.2"
+APP_VERSION = "1.3"
 
 
 def run(cmd):
@@ -1842,6 +1842,7 @@ def build_exam_bundle(capture_path="", target_lock_path="wifi_target_lock.json",
 
     if capture_path:
         bssid = target.get("bssid", "") if target else ""
+        payload["capture_doctor"] = capture_doctor(capture_path)
         payload["capture_statistics"] = capture_statistics(capture_path)
         payload["capture_analysis"] = analyze_capture(capture_path, bssid or None)
         payload["capture_quality"] = capture_quality(capture_path, bssid)
@@ -2453,6 +2454,136 @@ def export_scan_csv(output_path="wifi_scan.csv", query=""):
         "sha256": file_sha256(out),
     }
 
+
+def capture_doctor(path):
+    p = Path(path)
+    data = {
+        "capture": str(p),
+        "exists": p.exists(),
+        "size_bytes": p.stat().st_size if p.exists() else 0,
+        "sha256": file_sha256(p) if p.exists() else "",
+        "status": "NOT_CHECKED",
+        "checks": {},
+        "encapsulation_types": [],
+        "capinfos_excerpt": "",
+        "warnings": [],
+    }
+
+    if not p.exists():
+        data["status"] = "MISSING_FILE"
+        data["warnings"].append("Capture file does not exist.")
+        return data
+
+    if not tool_exists("tshark"):
+        data["status"] = "TSHARK_MISSING"
+        data["warnings"].append("TShark is required for capture validation.")
+        return data
+
+    rc, out = run(["tshark", "-r", str(p), "-c", "1", "-T", "fields", "-e", "frame.number"])
+    data["checks"]["tshark_readable"] = rc == 0
+
+    stats = capture_statistics(p)
+    data["checks"]["frames_present"] = (stats.get("frame_count") or 0) > 0
+    data["frame_count"] = stats.get("frame_count", 0)
+    data["duration_seconds"] = stats.get("duration_seconds")
+
+    def count_filter(display_filter):
+        return _count_tshark_filter(p, display_filter)
+
+    wlan_count = count_filter("wlan")
+    radiotap_count = count_filter("radiotap")
+    eapol_count = count_filter("eapol")
+    malformed_count = count_filter("_ws.malformed")
+
+    data["checks"]["wlan_frames_present"] = bool(wlan_count)
+    data["checks"]["radiotap_present"] = bool(radiotap_count)
+    data["checks"]["eapol_present"] = bool(eapol_count)
+    data["checks"]["malformed_frames_absent"] = (malformed_count == 0) if malformed_count is not None else None
+    data["wlan_frame_count"] = wlan_count
+    data["radiotap_frame_count"] = radiotap_count
+    data["eapol_frame_count"] = eapol_count
+    data["malformed_frame_count"] = malformed_count
+
+    available = _tshark_field_names()
+    encap_field = _first_supported_field(available, ["frame.encap_type"])
+    if encap_field:
+        rc, out = run([
+            "tshark", "-r", str(p),
+            "-T", "fields",
+            "-E", "occurrence=f",
+            "-e", encap_field,
+        ])
+        if rc == 0:
+            values = sorted({x.strip() for x in out.splitlines() if x.strip()})
+            data["encapsulation_types"] = values[:50]
+
+    if tool_exists("capinfos"):
+        rc, out = run(["capinfos", str(p)])
+        data["checks"]["capinfos_readable"] = rc == 0
+        data["capinfos_excerpt"] = out[:6000]
+    else:
+        data["checks"]["capinfos_readable"] = None
+
+    if not data["checks"]["tshark_readable"]:
+        data["status"] = "UNREADABLE_CAPTURE"
+    elif not data["checks"]["frames_present"]:
+        data["status"] = "EMPTY_CAPTURE"
+    elif not data["checks"]["wlan_frames_present"]:
+        data["status"] = "READABLE_NON_80211_CAPTURE"
+    elif data["checks"]["eapol_present"]:
+        data["status"] = "READY_FOR_WIFI_AND_EAPOL_ANALYSIS"
+    else:
+        data["status"] = "READY_FOR_WIFI_ANALYSIS_NO_EAPOL"
+
+    if data["checks"]["malformed_frames_absent"] is False:
+        data["warnings"].append("Malformed frames were reported by TShark; inspect capture quality.")
+    if not data["checks"]["radiotap_present"] and data["checks"]["wlan_frames_present"]:
+        data["warnings"].append(
+            "802.11 frames are present but radiotap metadata was not observed; signal/channel metadata may be limited."
+        )
+
+    return data
+
+
+def capture_ap_index(path, ssid_query=""):
+    profile = passive_ap_profiles(path)
+    q = str(ssid_query or "").casefold()
+    rows = []
+
+    for ap in profile.get("aps", []):
+        ssids = [str(x) for x in ap.get("ssids", [])]
+        if q and not any(q in s.casefold() for s in ssids):
+            continue
+        rows.append({
+            "bssid": ap.get("bssid", ""),
+            "ssids": ssids,
+            "channels": ap.get("channels", []),
+            "signal_dbm_avg": ap.get("signal_dbm_avg"),
+            "pmf_summary": ap.get("pmf_summary", ""),
+            "wps_advertised": ap.get("wps_advertised", False),
+            "akm_types": ap.get("akm_types", []),
+            "pairwise_cipher_types": ap.get("pairwise_cipher_types", []),
+            "management_observations": ap.get("management_observations", 0),
+        })
+
+    rows.sort(
+        key=lambda x: (
+            -(x["signal_dbm_avg"] if isinstance(x.get("signal_dbm_avg"), (int, float)) else -999),
+            x.get("bssid", ""),
+        )
+    )
+    return {
+        "capture": str(path),
+        "ssid_query": ssid_query,
+        "match_count": len(rows),
+        "aps": rows,
+        "warnings": profile.get("warnings", []),
+        "note": (
+            "This is an index of APs already present in the imported capture. "
+            "It does not probe or transmit to any network."
+        ),
+    }
+
 def save_report(payload, output="wifi_lab_report.json"):
     p = Path(output)
     envelope = {
@@ -2739,6 +2870,24 @@ def command_watch(args):
     return 0 if data.get("status") in {"SEEN", "AMBIGUOUS"} else 9
 
 
+
+def command_doctor(args):
+    data = capture_doctor(args.capture)
+    print(json.dumps(data, indent=2))
+    if args.report:
+        p = save_report({"capture_doctor": data}, args.report)
+        print(f"\nReport saved: {p}")
+    return 0 if data.get("status") in {"READY_FOR_WIFI_AND_EAPOL_ANALYSIS", "READY_FOR_WIFI_ANALYSIS_NO_EAPOL"} else 14
+
+
+def command_pcap_index(args):
+    data = capture_ap_index(args.capture, args.ssid)
+    print(json.dumps(data, indent=2))
+    if args.report:
+        p = save_report({"capture_ap_index": data}, args.report)
+        print(f"\nReport saved: {p}")
+    return 0 if data.get("match_count", 0) else 15
+
 def command_find(args):
     data = find_visible_targets(args.query, exact=args.exact)
     print(json.dumps(data, indent=2))
@@ -3010,6 +3159,17 @@ def build_parser():
     wt.add_argument("--samples", type=int, default=30, help="Number of scans; maximum 300.")
     wt.add_argument("--report", default="")
     wt.set_defaults(func=command_watch)
+
+    doc = sub.add_parser("doctor", help="Validate whether a PCAP/PCAPNG is usable for Wi-Fi/EAPOL analysis.")
+    doc.add_argument("capture")
+    doc.add_argument("--report", default="")
+    doc.set_defaults(func=command_doctor)
+
+    pi = sub.add_parser("pcap-index", help="List APs already present in an imported capture.")
+    pi.add_argument("capture")
+    pi.add_argument("--ssid", default="", help="Optional case-insensitive SSID substring.")
+    pi.add_argument("--report", default="")
+    pi.set_defaults(func=command_pcap_index)
 
     fnd = sub.add_parser("find", help="Find visible SSIDs by exact or partial name and sort by signal.")
     fnd.add_argument("query")
