@@ -1,4 +1,4 @@
-# WiFi Security Lab v0.3
+# WiFi Security Lab v0.4
 
 Functions-first CLI for an authorized classroom/home Wi-Fi security assessment.
 
@@ -25,6 +25,11 @@ Functions-first CLI for an authorized classroom/home Wi-Fi security assessment.
 - SSID-to-BSSID grouping and configuration-inconsistency warnings.
 - Local interface/gateway snapshot.
 - Anonymized station counts/tokens for a selected authorized AP (no raw client MACs in the report).
+- Readiness check for scanner, TShark, capture interfaces and required Wireshark fields.
+- Capture-quality assessment that explains missing exam evidence.
+- Local neighbor-table snapshot without active host scanning.
+- Tool-version inventory for reproducibility.
+- Automatic Windows EXE build pipeline plus Python compile/smoke checks.
 
 ## Intentionally not implemented
 
@@ -152,3 +157,40 @@ The capture statistics command may report how many association, authentication, 
 
 The program asks the installed TShark build for its field registry and only uses fields actually supported on that machine. This is important because Wireshark renamed several 802.11 management/RSN fields across major versions.
 
+
+
+## Readiness
+
+Before a lab/exam machine is used:
+
+```
+python wifi_lab.py readiness --report readiness.json
+```
+
+Possible high-level states include:
+
+- `READY_FOR_SCAN_AND_IMPORTED_CAPTURE_ANALYSIS`
+- `SCAN_READY_CAPTURE_ANALYSIS_INCOMPLETE`
+- `NOT_READY`
+
+## Capture quality
+
+Check whether an imported capture contains the expected AP/evidence:
+
+```
+python wifi_lab.py quality exam.pcapng --bssid AA:BB:CC:DD:EE:FF --report quality.json
+```
+
+The quality report distinguishes a strong evidence set, usable partial evidence, a capture missing core evidence, and an unusable/empty capture.
+
+## Local neighbor snapshot
+
+This reads only the operating system's existing ARP/neighbor table; it does not probe the LAN:
+
+```
+python wifi_lab.py neighbors
+```
+
+## Windows executable
+
+GitHub Actions now performs a Python compile check and CLI smoke test, then packages `wifi_lab.py` as a one-file Windows executable with PyInstaller.
