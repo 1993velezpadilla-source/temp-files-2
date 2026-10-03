@@ -1,4 +1,4 @@
-# WiFi Security Lab v1.6
+# WiFi Security Lab v1.7
 
 Functions-first CLI for an authorized classroom/home Wi-Fi security assessment.
 
@@ -69,6 +69,7 @@ No GUI work is required for this flow.
 - Exam preflight that reports blockers and warnings before the run.
 - Evidence-completeness score for the locked AP/capture set.
 - Chain-of-custody JSON with SHA-256 hashes for evidence/report files.
+- Passive deauthentication/disassociation observation with reconnect/EAPOL correlation.
 
 ## Intentionally not implemented
 
@@ -276,3 +277,20 @@ python wifi_lab.py custody exam.pcapng wifi_exam_bundle/exam_bundle.json --outpu
 ```
 
 The record includes SHA-256 hashes, file sizes, timestamps, host/runtime metadata, target fingerprint, and its own record hash.
+
+
+## Passive deauth/reconnect analysis
+
+Analyze disconnect frames that are already present in an authorized capture and correlate them with later authentication/association/EAPOL:
+
+```bash
+python wifi_lab.py deauth-observe exam.pcapng --bssid AA:BB:CC:DD:EE:FF --window 15 --report deauth_observation.json
+```
+
+Possible statuses include:
+
+- `DISCONNECT_TO_REAUTH_SEQUENCE_OBSERVED`
+- `DISCONNECT_FRAMES_OBSERVED_NO_EAPOL_CORRELATION`
+- `NO_DISCONNECT_FRAMES_OBSERVED`
+
+This command is passive only. It does not transmit deauthentication or disassociation frames.
