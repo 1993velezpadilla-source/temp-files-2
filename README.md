@@ -46,3 +46,14 @@ NZ:P gameplay-core reference pack:
 - [Audio / Feedback Director](docs/zombies-design-research/core-systems-open-research/AUDIO_FEEDBACK_DIRECTOR.md)
 - [Session Reset Lifecycle](docs/zombies-design-research/core-systems-open-research/SESSION_RESET_LIFECYCLE.md)
 - [Validation Test Matrix](docs/zombies-design-research/core-systems-open-research/VALIDATION_TEST_MATRIX.md)
+
+## Treyarch Zombies environment / map-authoring atlas
+
+- [Environment Atlas Index](docs/zombies-design-research/treyarch-map-environment-atlas/README.md)
+- [Official Map Catalog](docs/zombies-design-research/treyarch-map-environment-atlas/MAP_CATALOG.md)
+- [Per-Map Environment Notes](docs/zombies-design-research/treyarch-map-environment-atlas/PER_MAP_NOTES.md)
+- [Environment Grammar](docs/zombies-design-research/treyarch-map-environment-atlas/ENVIRONMENT_GRAMMAR.md)
+- [Prop Placement Taxonomy](docs/zombies-design-research/treyarch-map-environment-atlas/PROP_PLACEMENT_TAXONOMY.md)
+- [Measurement & Placement Guide](docs/zombies-design-research/treyarch-map-environment-atlas/MEASUREMENT_AND_PLACEMENT_GUIDE.md)
+- [Original Map Authoring Template](docs/zombies-design-research/treyarch-map-environment-atlas/MAP_AUTHORING_TEMPLATE.md)
+- [Sources & Provenance](docs/zombies-design-research/treyarch-map-environment-atlas/SOURCES.md)
