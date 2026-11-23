@@ -131,8 +131,8 @@ function createBlocks(){
    if(pts.some(p=>roadGap(p[0],p[1])<12))continue;
    const zone=district(cx,cy),names=picks[zone],img=names[Math.floor(rand()*names.length)];
    const style=(zone==='finance'||zone==='industrial')?0:(zone==='music'?2:(zone==='market'?2:1));
-   const col=Math.floor(rand()*10);
-   buildings.push({x,y,w,h,img,zone,sheetCol:col,sheetRow:style});
+   const sheetColumn=Math.floor(rand()*10);
+   buildings.push({x,y,w,h,img,zone,sheetCol:sheetColumn,sheetRow:style});
   }
  }
  landmarks.push(
