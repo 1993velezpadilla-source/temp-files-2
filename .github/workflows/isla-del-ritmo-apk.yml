@@ -28,10 +28,10 @@ jobs:
       - name: Install Android build SDK
         run: |
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0"
-      - name: Gradle 8.10.3
+      - name: Gradle 8.10.2
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.10.3'
+          gradle-version: '8.10.2'
       - name: Bundle game HTML and inline PNG art
         run: |
           mkdir -p demos/isla-del-ritmo/android/app/src/main/assets
