@@ -25,7 +25,8 @@ jobs:
       - name: Use Android SDK from GitHub runner
         run: echo "ANDROID_HOME=$ANDROID_HOME; sdkmanager=$(command -v sdkmanager)"
       - name: Install Android build SDK
-        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0"
       - name: Gradle 8.10.2
         uses: gradle/actions/setup-gradle@v4
         with:
