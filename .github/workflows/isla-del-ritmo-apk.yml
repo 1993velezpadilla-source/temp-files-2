@@ -3,7 +3,8 @@ on:
   push:
     branches: [main]
     paths:
-      - 'demos/isla-del-ritmo/**'
+      - 'demos/isla-del-ritmo/android/**'
+      - 'demos/isla-del-ritmo/v0.2/**'
       - '.github/workflows/isla-del-ritmo-apk.yml'
   workflow_dispatch:
 
@@ -34,7 +35,7 @@ jobs:
       - name: Bundle game HTML and inline PNG art
         run: |
           mkdir -p demos/isla-del-ritmo/android/app/src/main/assets
-          cp demos/isla-del-ritmo/v0.1/ISLA_DEL_RITMO_JUGAR.html demos/isla-del-ritmo/android/app/src/main/assets/index.html
+          cp demos/isla-del-ritmo/v0.2/ISLA_DEL_RITMO_JUGAR.html demos/isla-del-ritmo/android/app/src/main/assets/index.html
           test -s demos/isla-del-ritmo/android/app/src/main/assets/index.html
       - name: Compile installable Android APK
         working-directory: demos/isla-del-ritmo/android
@@ -42,20 +43,20 @@ jobs:
       - name: Prepare download
         run: |
           mkdir -p demos/isla-del-ritmo/download
-          cp demos/isla-del-ritmo/android/app/build/outputs/apk/debug/app-debug.apk demos/isla-del-ritmo/download/IslaDelRitmo-Demo-0.1.apk
-          test -s demos/isla-del-ritmo/download/IslaDelRitmo-Demo-0.1.apk
+          cp demos/isla-del-ritmo/android/app/build/outputs/apk/debug/app-debug.apk demos/isla-del-ritmo/download/IslaDelRitmo-Demo-0.2.apk
+          test -s demos/isla-del-ritmo/download/IslaDelRitmo-Demo-0.2.apk
       - name: Attach installable APK to workflow
         uses: actions/upload-artifact@v4
         with:
-          name: IslaDelRitmo-Android-Demo-0.1
-          path: demos/isla-del-ritmo/download/IslaDelRitmo-Demo-0.1.apk
+          name: IslaDelRitmo-Android-Demo-0.2
+          path: demos/isla-del-ritmo/download/IslaDelRitmo-Demo-0.2.apk
       - name: Publish direct GitHub APK download
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add demos/isla-del-ritmo/download/IslaDelRitmo-Demo-0.1.apk
+          git add demos/isla-del-ritmo/download/IslaDelRitmo-Demo-0.2.apk
           if ! git diff --cached --quiet; then
-            git commit -m "Release installable Isla del Ritmo Android demo 0.1"
+            git commit -m "Release installable Isla del Ritmo Android demo 0.2"
             git push origin HEAD:main
           fi
       - name: Attach APK to GitHub Release
@@ -63,10 +64,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          apk="demos/isla-del-ritmo/download/IslaDelRitmo-Demo-0.1.apk"
-          tag="isla-del-ritmo-v0.1"
+          apk="demos/isla-del-ritmo/download/IslaDelRitmo-Demo-0.2.apk"
+          tag="isla-del-ritmo-v0.2"
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" "$apk" --clobber
           else
-            gh release create "$tag" "$apk" --title "Isla del Ritmo — Android Demo 0.1" --notes "APK Android instalable. Juego offline, PNG integrados y soporte para importar una canción APEX."
+            gh release create "$tag" "$apk" --title "Isla del Ritmo — Android Demo 0.2" --notes "APK Android instalable. Juego offline, PNG integrados y soporte para importar una canción APEX."
           fi
